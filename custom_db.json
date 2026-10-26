@@ -3,5 +3,10 @@
     "name": "Firefox",
     "folder": "Mozilla Firefox",
     "exe": ["firefox.exe"]
+  },
+  {
+    "name": "EA SPORTS FC™ 27",
+    "folder": "EASPORTSFC27",
+    "exe": ["EASPORTSFC27.exe"]
   }
 ]
