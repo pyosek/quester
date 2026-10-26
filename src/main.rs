@@ -17,6 +17,8 @@ const UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (
 const APP_TITLE: &str = "Yarok Launcher";
 const MAX_RESULTS: usize = 150;
 const CREATE_NO_WINDOW: u32 = 0x08000000;
+const GITHUB_DB_URL: &str =
+    "https://raw.githubusercontent.com/pyosek/yarok-launcher/refs/heads/main/custom_db.json";
 
 #[derive(Clone, Serialize, Deserialize)]
 struct ManifestEntry {
@@ -279,8 +281,18 @@ fn kill_pid(pid: u32) {
 
 #[derive(Clone, Serialize, Deserialize)]
 struct Game {
+    #[serde(default)]
     name: String,
+    #[serde(default)]
+    folder: String,
+    #[serde(alias = "exe")]
     exes: Vec<String>,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Tab {
+    DiscordDb,
+    GithubDb,
 }
 
 struct RunningGame {
@@ -291,6 +303,7 @@ struct RunningGame {
 
 enum Msg {
     DiscordGames(Vec<Game>),
+    GithubGames(Vec<Game>),
     Log(String),
 }
 
@@ -382,7 +395,11 @@ fn build_discord_games(apps: &[Value]) -> Vec<Game> {
             if exes.is_empty() {
                 return None;
             }
-            Some(Game { name, exes })
+            Some(Game {
+                name,
+                folder: String::new(),
+                exes,
+            })
         })
         .collect();
     out.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
@@ -408,6 +425,8 @@ struct App {
     apps_requested: bool,
 
     discord_games: Vec<Game>,
+    github_games: Vec<Game>,
+    tab: Tab,
 
     search: String,
     log: Vec<String>,
@@ -437,6 +456,8 @@ impl App {
             style_set: false,
             apps_requested: false,
             discord_games: vec![],
+            github_games: vec![],
+            tab: Tab::DiscordDb,
             search: String::new(),
             log: vec!["Loading game databases...".to_string()],
             tx,
@@ -467,7 +488,45 @@ impl App {
     }
 
     fn load_games(&mut self) {
-        self.push_log("Refreshing Discord DB...");
+        self.push_log("Refreshing Discord DB and GitHub DB...");
+
+        let tx2 = self.tx.clone();
+        thread::spawn(move || {
+            let client = match reqwest::blocking::Client::builder()
+                .user_agent(UA)
+                .timeout(Duration::from_secs(20))
+                .build()
+            {
+                Ok(c) => c,
+                Err(e) => {
+                    let _ = tx2.send(Msg::Log(format!("GitHub DB client error: {e}")));
+                    return;
+                }
+            };
+            let text = match client.get(GITHUB_DB_URL).send().and_then(|r| r.text()) {
+                Ok(t) => t,
+                Err(e) => {
+                    let _ = tx2.send(Msg::Log(format!("GitHub DB network error: {e}")));
+                    return;
+                }
+            };
+            match serde_json::from_str::<Vec<Game>>(&text) {
+                Ok(mut games) => {
+                    games.retain(|g| !g.exes.is_empty());
+                    for g in games.iter_mut() {
+                        if g.name.trim().is_empty() {
+                            g.name = format!("{}/{}", g.folder, g.exes[0]);
+                        }
+                    }
+                    games.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+                    let _ = tx2.send(Msg::GithubGames(games));
+                }
+                Err(e) => {
+                    let _ = tx2.send(Msg::Log(format!("GitHub DB JSON error: {e}")));
+                }
+            }
+        });
+
         let tx = self.tx.clone();
         thread::spawn(move || {
             let client = match reqwest::blocking::Client::builder()
@@ -526,7 +585,17 @@ impl App {
             return;
         }
         let me = env::current_exe().unwrap();
-        let base = games_dir();
+
+        if !g.folder.is_empty() && !rel_is_safe(&g.folder) {
+            self.push_log(format!("Refused unsafe folder: {}", g.folder));
+            return;
+        }
+        let base = if g.folder.is_empty() {
+            games_dir()
+        } else {
+            games_dir().join(&g.folder)
+        };
+
         for rel in &g.exes {
             if !rel_is_safe(rel) {
                 self.push_log(format!("Refused unsafe path: {rel}"));
@@ -623,7 +692,6 @@ impl App {
         }
         ctx.request_repaint();
     }
-
 }
 
 impl eframe::App for App {
@@ -643,6 +711,10 @@ impl eframe::App for App {
                     self.push_log(format!("Discord DB loaded: {} games", g.len()));
                     self.discord_games = g;
                 }
+                Msg::GithubGames(g) => {
+                    self.push_log(format!("GitHub DB loaded: {} games", g.len()));
+                    self.github_games = g;
+                }
                 Msg::Log(s) => self.push_log(s),
             }
         }
@@ -660,7 +732,7 @@ impl eframe::App for App {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui
                         .add(egui::Button::new("Refresh").min_size(size))
-                        .on_hover_text("Refresh Discord DB")
+                        .on_hover_text("Refresh Discord DB and GitHub DB")
                         .clicked()
                     {
                         self.load_games();
@@ -677,6 +749,14 @@ impl eframe::App for App {
                         self.push_log(format!("Cleanup: removed {cleaned}, skipped {skipped}"));
                     }
                 });
+            });
+
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                let d = format!("Discord DB ({})", self.discord_games.len());
+                let c = format!("GitHub DB ({})", self.github_games.len());
+                ui.selectable_value(&mut self.tab, Tab::DiscordDb, d);
+                ui.selectable_value(&mut self.tab, Tab::GithubDb, c);
             });
 
             ui.add_space(6.0);
@@ -748,8 +828,12 @@ impl eframe::App for App {
         egui::CentralPanel::default().show(ctx, |ui| {
             let search = self.search.to_lowercase();
 
-            let filtered: Vec<Game> = self
-                .discord_games
+            let source = match self.tab {
+                Tab::DiscordDb => &self.discord_games,
+                Tab::GithubDb => &self.github_games,
+            };
+            let source_empty = source.is_empty();
+            let filtered: Vec<Game> = source
                 .iter()
                 .filter(|g| search.is_empty() || g.name.to_lowercase().contains(&search))
                 .take(MAX_RESULTS)
@@ -761,11 +845,11 @@ impl eframe::App for App {
             }
 
             egui::ScrollArea::vertical()
-                .id_salt("discord_games_scroll")
+                .id_salt("games_scroll")
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
-                    if self.discord_games.is_empty() {
-                        ui.small("Loading Discord DB...");
+                    if source_empty {
+                        ui.small("Nothing loaded yet...");
                     }
                     for g in filtered {
                         let already = self.is_running(&g.name);

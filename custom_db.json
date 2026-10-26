@@ -1,0 +1,7 @@
+[
+  {
+    "name": "Firefox",
+    "folder": "Mozilla Firefox",
+    "exe": ["firefox.exe"]
+  }
+]
