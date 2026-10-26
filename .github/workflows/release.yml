@@ -1,0 +1,77 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        required: true
+        default: 'v1.0.1'
+      prerelease:
+        type: boolean
+        default: false
+
+concurrency:
+  group: release-${{ inputs.tag }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -C target-feature=+crt-static
+
+jobs:
+  release:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+
+    steps:
+      - name: Validate tag
+        shell: pwsh
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          if ($env:TAG -notmatch '^v\d+\.\d+\.\d+(-[0-9A-Za-z.]+)?$') {
+            throw "Invalid tag '$env:TAG'"
+          }
+
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Stage artifacts and generate SHA256
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          $exes = Get-ChildItem -Path "target/release/*.exe"
+          if ($exes.Count -eq 0) { throw "No exe files found" }
+
+          $lines = @()
+          foreach ($exe in $exes) {
+            Copy-Item $exe.FullName -Destination dist/
+            $hash = (Get-FileHash -Path $exe.FullName -Algorithm SHA256).Hash.ToLower()
+            $lines += "$hash  $($exe.Name)"
+            Write-Host "$hash  $($exe.Name)"
+          }
+          Set-Content -Path dist/SHA256SUMS.txt -Value $lines -Encoding utf8
+
+      - name: Create Release and Upload Assets
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag }}
+          name: Release ${{ inputs.tag }}
+          target_commitish: ${{ github.sha }}
+          files: |
+            dist/*.exe
+            dist/SHA256SUMS.txt
+          fail_on_unmatched_files: true
+          draft: false
+          prerelease: ${{ inputs.prerelease }}
+          generate_release_notes: true
