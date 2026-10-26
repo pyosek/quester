@@ -46,21 +46,23 @@ jobs:
       - name: Build
         run: cargo build --release
 
-      - name: Stage artifacts and generate SHA256
+      - name: Package
         shell: pwsh
+        env:
+          TAG: ${{ inputs.tag }}
+          NAME: ${{ github.event.repository.name }}
         run: |
-          New-Item -ItemType Directory -Force -Path dist | Out-Null
           $exes = Get-ChildItem -Path "target/release/*.exe"
           if ($exes.Count -eq 0) { throw "No exe files found" }
 
-          $lines = @()
-          foreach ($exe in $exes) {
-            Copy-Item $exe.FullName -Destination dist/
-            $hash = (Get-FileHash -Path $exe.FullName -Algorithm SHA256).Hash.ToLower()
-            $lines += "$hash  $($exe.Name)"
-            Write-Host "$hash  $($exe.Name)"
-          }
-          Set-Content -Path dist/SHA256SUMS.txt -Value $lines -Encoding utf8
+          $pkg = "pkg/$env:NAME"
+          New-Item -ItemType Directory -Force -Path $pkg | Out-Null
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+
+          Copy-Item $exes.FullName -Destination $pkg
+
+          $zip = "dist/$env:NAME-$env:TAG.zip"
+          Compress-Archive -Path $pkg -DestinationPath $zip -Force
 
       - name: Create Release and Upload Assets
         uses: softprops/action-gh-release@v2
@@ -69,8 +71,7 @@ jobs:
           name: Release ${{ inputs.tag }}
           target_commitish: ${{ github.sha }}
           files: |
-            dist/*.exe
-            dist/SHA256SUMS.txt
+            dist/*.zip
           fail_on_unmatched_files: true
           draft: false
           prerelease: ${{ inputs.prerelease }}
