@@ -5,7 +5,7 @@ on:
     inputs:
       tag:
         required: true
-        default: 'v1.0.1'
+        default: 'v1.1.0'
       prerelease:
         type: boolean
         default: false
