@@ -21,6 +21,6 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: yarok-launcher-windows
+          name: quester-windows
           path: target/release/*.exe
           if-no-files-found: error
