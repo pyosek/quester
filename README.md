@@ -13,3 +13,11 @@ This tool may violate Discord's Terms of Service and could put your account at r
 ## Screenshot
 <img width="352" height="552" alt="image" src="https://github.com/user-attachments/assets/937b661c-4069-4584-8b12-65d61b8bd2e7" />
 
+## 
+<a href="https://star-history.com/#pyosek/quester&Date">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=pyosek/quester&type=Date&theme=dark" />
+    <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=pyosek/quester&type=Date" />
+    <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=pyosek/quester&type=Date" />
+  </picture>
+</a>
