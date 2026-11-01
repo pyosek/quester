@@ -11,8 +11,16 @@ pub struct Game {
     pub folder: String,
     #[serde(alias = "exe")]
     pub exes: Vec<String>,
+    #[serde(default, rename = "type")]
+    pub kind: String,
     #[serde(skip)]
     pub lname: String,
+}
+
+impl Game {
+    pub fn is_steam(&self) -> bool {
+        self.kind.eq_ignore_ascii_case("steam")
+    }
 }
 
 fn exes_for_app(app: &Value) -> Vec<String> {
@@ -62,6 +70,7 @@ fn build_games(apps: &[Value]) -> Vec<Game> {
                 name,
                 folder: String::new(),
                 exes,
+                kind: String::new(),
             })
         })
         .collect();

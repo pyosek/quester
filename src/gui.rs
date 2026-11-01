@@ -1,14 +1,15 @@
 use crate::{
-    config::{exe_dir, log_crash, now_ts, Msg, Notifier, APP_NAME, VERSION},
+    config::{exe_dir, games_dir, log_crash, now_ts, Msg, Notifier, APP_NAME, VERSION},
     discord::{self, Game},
     github,
     process::{
-        alive_pids, cleanup_manifest, kill_pid, launch_fake, pid_is_ours, running_load,
-        running_save, RunningEntry,
+        alive_pids, kill_pid, launch_fake, pid_is_ours, running_load, running_save,
+        steam_dir, steam_needs_confirm, steam_state, RunningEntry, SteamState,
     },
 };
 use eframe::egui::{self, Color32, Margin, Rounding, Stroke};
 use std::{
+    collections::HashMap,
     fs,
     sync::mpsc::{channel, Receiver},
     thread,
@@ -31,16 +32,41 @@ const DIM: Color32 = Color32::from_rgb(110, 110, 118);
 const GLOW: Color32 = Color32::from_rgba_premultiplied(30, 30, 32, 110);
 
 fn setup_fonts(ctx: &egui::Context) {
+    let mut fonts = egui::FontDefinitions::default();
+
     if let Ok(bytes) = fs::read(exe_dir().join("Skranji-Regular.ttf")) {
-        let mut fonts = egui::FontDefinitions::default();
         fonts
             .font_data
             .insert("skranji".to_owned(), egui::FontData::from_owned(bytes).into());
         if let Some(f) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
             f.insert(0, "skranji".to_owned());
         }
-        ctx.set_fonts(fonts);
     }
+
+    let win = std::env::var("WINDIR").unwrap_or_else(|_| "C:\\Windows".to_string());
+    let fallbacks = [
+        ("sys_cjk_sc", "msyh.ttc"),
+        ("sys_cjk_jp", "YuGothM.ttc"),
+        ("sys_cjk_jp2", "meiryo.ttc"),
+        ("sys_cjk_kr", "malgun.ttf"),
+        ("sys_symbols", "seguisym.ttf"),
+        ("sys_ui", "segoeui.ttf"),
+    ];
+    for (key, file) in fallbacks {
+        let path = std::path::Path::new(&win).join("Fonts").join(file);
+        if let Ok(bytes) = fs::read(&path) {
+            fonts
+                .font_data
+                .insert(key.to_owned(), egui::FontData::from_owned(bytes).into());
+            for fam in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+                if let Some(f) = fonts.families.get_mut(&fam) {
+                    f.push(key.to_owned());
+                }
+            }
+        }
+    }
+
+    ctx.set_fonts(fonts);
 }
 
 fn apply_theme(ctx: &egui::Context) {
@@ -201,6 +227,68 @@ fn list_row(ui: &mut egui::Ui, name: &str, action: Option<&str>) -> bool {
     clicked
 }
 
+fn steam_row(
+    ui: &mut egui::Ui,
+    name: &str,
+    running: bool,
+    can_run: bool,
+    folder_ok: bool,
+) -> (bool, bool) {
+    let (mut run, mut folder) = (false, false);
+    row_frame().show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        ui.set_height(ROW_CONTENT_H);
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if running {
+                ui.label(egui::RichText::new("running").color(DIM));
+            } else {
+                let r = ui
+                    .add_enabled(
+                        can_run,
+                        egui::Button::new(egui::RichText::new("run").size(13.0))
+                            .min_size(egui::vec2(46.0, 0.0)),
+                    )
+                    .on_hover_cursor(egui::CursorIcon::PointingHand)
+                    .on_disabled_hover_text(
+                        "Folder exists and was not created by Quester, or Steam was not found",
+                    );
+                if r.clicked() {
+                    run = true;
+                }
+            }
+            let fr = ui
+                .add_enabled(
+                    folder_ok,
+                    egui::Button::new(egui::RichText::new("folder").size(13.0))
+                        .min_size(egui::vec2(46.0, 0.0)),
+                )
+                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                .on_disabled_hover_text("Folder doesn't exist yet or has no valid quester.txt");
+            if fr.clicked() {
+                folder = true;
+            }
+            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                name_label(ui, name);
+            });
+        });
+    });
+    (run, folder)
+}
+
+fn cached_state(
+    cache: &mut HashMap<String, (Instant, SteamState)>,
+    g: &Game,
+) -> SteamState {
+    if let Some((t, s)) = cache.get(&g.folder) {
+        if t.elapsed() < Duration::from_millis(1500) {
+            return *s;
+        }
+    }
+    let s = steam_state(g);
+    cache.insert(g.folder.clone(), (Instant::now(), s));
+    s
+}
+
 #[derive(Clone, Copy, PartialEq)]
 enum Tab {
     DiscordDb,
@@ -238,6 +326,9 @@ struct App {
 
     show_logs: bool,
     show_running: bool,
+
+    pending_steam: Option<Game>,
+    steam_cache: HashMap<String, (Instant, SteamState)>,
 }
 
 impl App {
@@ -279,6 +370,8 @@ impl App {
             alive_inflight: false,
             show_logs: false,
             show_running: false,
+            pending_steam: None,
+            steam_cache: HashMap::new(),
         }
     }
 
@@ -312,10 +405,62 @@ impl App {
         self.running.iter().any(|g| g.app_name == name)
     }
 
+    fn open_game_folder(&mut self, g: &Game) {
+        if steam_state(g) != SteamState::Ours {
+            self.push_log("Folder is not a Quester folder, not opening");
+            return;
+        }
+        if let Some(dir) = steam_dir(g) {
+            if let Err(e) = std::process::Command::new("explorer").arg(&dir).spawn() {
+                self.push_log(format!("Could not open folder: {e}"));
+            }
+        }
+    }
+
+    fn window_confirm(&mut self, ctx: &egui::Context) {
+        let Some(g) = self.pending_steam.clone() else {
+            return;
+        };
+        let dir = steam_dir(&g)
+            .map(|d| d.display().to_string())
+            .unwrap_or_default();
+        let mut decision = None;
+        egui::Window::new(APP_NAME)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.set_max_width(280.0);
+                ui.label(format!("An .exe will be created in {dir}."));
+                ui.label(
+                    egui::RichText::new("Delete the folder yourself afterwards.")
+                        .color(Color32::from_rgb(0xe3, 0x26, 0x36)),
+                );
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if pill(ui, "OK").clicked() {
+                        decision = Some(true);
+                    }
+                    if pill(ui, "Cancel").clicked() {
+                        decision = Some(false);
+                    }
+                });
+            });
+        match decision {
+            Some(true) => {
+                self.pending_steam = None;
+                self.run_fake_discord(g);
+            }
+            Some(false) => self.pending_steam = None,
+            None => {}
+        }
+    }
+
     fn run_fake_discord(&mut self, g: Game) {
         if self.is_running(&g.name) {
             return;
         }
+        self.steam_cache.clear();
         let (pid, lines) = launch_fake(&g);
         for l in lines {
             self.push_log(l);
@@ -420,15 +565,15 @@ impl App {
                 ui.label(egui::RichText::new(VERSION).small().color(DIM));
             });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if pill(ui, "clean").clicked() {
-                    let (cleaned, skipped, lines) = cleanup_manifest();
-                    for l in lines {
-                        self.push_log(l);
-                    }
-                    self.push_log(format!("Cleanup: removed {cleaned}, skipped {skipped}"));
-                }
                 if pill(ui, "refresh").clicked() {
                     self.load_games();
+                }
+                if pill(ui, "folder").clicked() {
+                    let dir = games_dir();
+                    let _ = fs::create_dir_all(&dir);
+                    if let Err(e) = std::process::Command::new("explorer").arg(&dir).spawn() {
+                        self.push_log(format!("Could not open folder: {e}"));
+                    }
                 }
             });
         });
@@ -465,6 +610,7 @@ impl App {
         }
 
         let mut to_run = None;
+        let mut to_folder = None;
         egui::ScrollArea::vertical()
             .id_salt("games_scroll")
             .auto_shrink([false, false])
@@ -473,17 +619,38 @@ impl App {
                     let Some(&gi) = self.filtered.get(i) else { break };
                     let Some(g) = source.get(gi) else { continue };
                     let running = self.running.iter().any(|r| r.app_name == g.name);
-                    let action = if running { None } else { Some("run") };
-                    if list_row(ui, &g.name, action) {
-                        to_run = Some(gi);
+                    if g.is_steam() {
+                        let st = cached_state(&mut self.steam_cache, g);
+                        let can_run = !matches!(st, SteamState::Foreign | SteamState::Invalid);
+                        let (r, f) =
+                            steam_row(ui, &g.name, running, can_run, st == SteamState::Ours);
+                        if r {
+                            to_run = Some(gi);
+                        }
+                        if f {
+                            to_folder = Some(gi);
+                        }
+                    } else {
+                        let action = if running { None } else { Some("run") };
+                        if list_row(ui, &g.name, action) {
+                            to_run = Some(gi);
+                        }
                     }
                 }
             });
 
-        if let Some(gi) = to_run {
-            if let Some(g) = source.get(gi).cloned() {
+        let run_game = to_run.and_then(|gi| source.get(gi).cloned());
+        let folder_game = to_folder.and_then(|gi| source.get(gi).cloned());
+
+        if let Some(g) = run_game {
+            if g.is_steam() && steam_needs_confirm(&g) {
+                self.pending_steam = Some(g);
+            } else {
                 self.run_fake_discord(g);
             }
+        }
+        if let Some(g) = folder_game {
+            self.open_game_folder(&g);
         }
     }
 
@@ -627,6 +794,7 @@ impl eframe::App for App {
 
         self.window_running(ctx);
         self.window_logs(ctx);
+        self.window_confirm(ctx);
     }
 }
 

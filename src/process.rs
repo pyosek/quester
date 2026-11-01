@@ -1,5 +1,5 @@
 use crate::{
-    config::{exe_dir, games_dir, now_ts},
+    config::{exe_dir, games_dir, now_ts, MARKER_FILE, MARKER_TEXT},
     discord::Game,
 };
 use serde::{Deserialize, Serialize};
@@ -8,6 +8,7 @@ use std::{
     os::windows::process::CommandExt,
     path::{Path, PathBuf},
     process::Command,
+    sync::OnceLock,
 };
 
 const CREATE_NO_WINDOW: u32 = 0x08000000;
@@ -45,6 +46,124 @@ fn norm_path(s: &str) -> String {
         .to_lowercase()
         .trim_end_matches('\\')
         .to_string()
+}
+
+#[derive(Clone, Copy, PartialEq)]
+pub enum SteamState {
+    Invalid,
+    NoDir,
+    Ours,
+    Foreign,
+}
+
+fn reg_steam_path() -> Option<PathBuf> {
+    let o = Command::new("reg")
+        .args(["query", r"HKCU\Software\Valve\Steam", "/v", "SteamPath"])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .ok()?;
+    let s = String::from_utf8_lossy(&o.stdout);
+    for l in s.lines() {
+        if let Some(i) = l.find("REG_SZ") {
+            let v = l[i + 6..].trim();
+            if !v.is_empty() {
+                return Some(PathBuf::from(v.replace('/', "\\")));
+            }
+        }
+    }
+    None
+}
+
+fn push_unique(v: &mut Vec<PathBuf>, p: PathBuf) {
+    if !v.contains(&p) {
+        v.push(p);
+    }
+}
+
+fn steam_roots() -> &'static Vec<PathBuf> {
+    static ROOTS: OnceLock<Vec<PathBuf>> = OnceLock::new();
+    ROOTS.get_or_init(|| {
+        let mut bases: Vec<PathBuf> = vec![];
+        if let Some(p) = reg_steam_path() {
+            bases.push(p);
+        }
+        bases.push(PathBuf::from(r"C:\Program Files (x86)\Steam"));
+
+        let mut libs: Vec<PathBuf> = vec![];
+        for b in &bases {
+            if !b.join("steamapps").is_dir() {
+                continue;
+            }
+            push_unique(&mut libs, b.clone());
+            if let Ok(t) = fs::read_to_string(b.join("steamapps").join("libraryfolders.vdf")) {
+                for l in t.lines() {
+                    let parts: Vec<&str> = l.split('"').collect();
+                    if parts.len() >= 4 && parts[1] == "path" {
+                        push_unique(&mut libs, PathBuf::from(parts[3].replace("\\\\", "\\")));
+                    }
+                }
+            }
+        }
+        libs.into_iter()
+            .map(|l| l.join("steamapps").join("common"))
+            .filter(|c| c.is_dir())
+            .collect()
+    })
+}
+
+fn inside_root(p: &Path, root: &Path) -> bool {
+    match (fs::canonicalize(p), fs::canonicalize(root)) {
+        (Ok(a), Ok(b)) => a.starts_with(&b),
+        _ => false,
+    }
+}
+
+fn steam_loc(g: &Game) -> Option<(PathBuf, PathBuf)> {
+    if g.folder.is_empty() || !rel_is_safe(&g.folder) {
+        return None;
+    }
+    let roots = steam_roots();
+    for r in roots {
+        let d = r.join(&g.folder);
+        if d.exists() {
+            return Some((r.clone(), d));
+        }
+    }
+    roots.first().map(|r| (r.clone(), r.join(&g.folder)))
+}
+
+pub fn steam_dir(g: &Game) -> Option<PathBuf> {
+    steam_loc(g).map(|x| x.1)
+}
+
+fn marker_ok(dir: &Path) -> bool {
+    fs::read_to_string(dir.join(MARKER_FILE))
+        .map(|s| s.trim_start_matches('\u{feff}').trim() == MARKER_TEXT)
+        .unwrap_or(false)
+}
+
+pub fn steam_state(g: &Game) -> SteamState {
+    let Some((root, dir)) = steam_loc(g) else {
+        return SteamState::Invalid;
+    };
+    if !dir.exists() {
+        SteamState::NoDir
+    } else if inside_root(&dir, &root) && marker_ok(&dir) {
+        SteamState::Ours
+    } else {
+        SteamState::Foreign
+    }
+}
+
+pub fn steam_needs_confirm(g: &Game) -> bool {
+    let Some(dir) = steam_dir(g) else {
+        return true;
+    };
+    steam_state(g) != SteamState::Ours
+        || !g
+            .exes
+            .iter()
+            .any(|r| rel_is_safe(r) && dir.join(r).exists())
 }
 
 fn manifest_load() -> Vec<ManifestEntry> {
@@ -94,98 +213,6 @@ fn create_dirs_tracked(dir: &Path, quest_app: &str) {
             });
         }
     }
-}
-
-pub fn cleanup_manifest() -> (usize, usize, Vec<String>) {
-    let entries = manifest_load();
-    let mut cleaned = 0usize;
-    let mut skipped = 0usize;
-    let mut log = vec![];
-    let mut remaining = vec![];
-    let cur_exe_len = env::current_exe()
-        .ok()
-        .and_then(|p| fs::metadata(p).ok())
-        .map(|m| m.len())
-        .unwrap_or(0);
-    let (files, mut dirs): (Vec<_>, Vec<_>) = entries.into_iter().partition(|e| e.kind == "file");
-
-    for e in files {
-        let p = PathBuf::from(&e.path);
-        if !p.exists() {
-            cleaned += 1;
-            continue;
-        }
-        if !inside_games(&p) {
-            skipped += 1;
-            log.push(format!(
-                "Skipped file (outside games folder, NOT touching it): {}",
-                e.path
-            ));
-            continue;
-        }
-        let len = fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
-        let ours = e.size == 0 || len == e.size || len == cur_exe_len;
-        if !ours {
-            skipped += 1;
-            log.push(format!(
-                "Skipped file (changed since creation, NOT touching it): {}",
-                e.path
-            ));
-            continue;
-        }
-        match fs::remove_file(&p) {
-            Ok(_) => {
-                cleaned += 1;
-                log.push(format!("Removed file: {}", e.path));
-            }
-            Err(err) => {
-                skipped += 1;
-                log.push(format!("Could not remove file {}: {err}", e.path));
-                remaining.push(e);
-            }
-        }
-    }
-
-    dirs.sort_by_key(|e| std::cmp::Reverse(PathBuf::from(&e.path).components().count()));
-
-    for e in dirs {
-        let p = PathBuf::from(&e.path);
-        if !p.exists() {
-            cleaned += 1;
-            continue;
-        }
-        if !inside_games(&p) {
-            skipped += 1;
-            log.push(format!(
-                "Skipped folder (outside games folder, NOT touching it): {}",
-                e.path
-            ));
-            continue;
-        }
-        let is_empty = fs::read_dir(&p)
-            .map(|mut it| it.next().is_none())
-            .unwrap_or(false);
-        if !is_empty {
-            skipped += 1;
-            log.push(format!("Skipped folder (not empty, leaving it): {}", e.path));
-            remaining.push(e);
-            continue;
-        }
-        match fs::remove_dir(&p) {
-            Ok(_) => {
-                cleaned += 1;
-                log.push(format!("Removed folder: {}", e.path));
-            }
-            Err(err) => {
-                skipped += 1;
-                log.push(format!("Could not remove folder {}: {err}", e.path));
-                remaining.push(e);
-            }
-        }
-    }
-
-    manifest_save(&remaining);
-    (cleaned, skipped, log)
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -246,10 +273,29 @@ pub fn pid_is_ours(pid: u32) -> bool {
     if path.is_empty() {
         return false;
     }
-    match (fs::canonicalize(&path), fs::canonicalize(games_dir())) {
-        (Ok(p), Ok(g)) => p.starts_with(&g),
-        _ => false,
+    let Ok(p) = fs::canonicalize(&path) else {
+        return false;
+    };
+    if let Ok(g) = fs::canonicalize(games_dir()) {
+        if p.starts_with(&g) {
+            return true;
+        }
     }
+    for root in steam_roots() {
+        let Ok(r) = fs::canonicalize(root) else { continue };
+        if !p.starts_with(&r) {
+            continue;
+        }
+        for anc in p.ancestors().skip(1) {
+            if anc == r || !anc.starts_with(&r) {
+                break;
+            }
+            if marker_ok(anc) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 pub fn kill_pid(pid: u32) {
@@ -274,11 +320,45 @@ pub fn launch_fake(g: &Game) -> (Option<u32>, Vec<String>) {
         log.push(format!("Refused unsafe folder: {}", g.folder));
         return (None, log);
     }
-    let base = if g.folder.is_empty() {
+    let mut base = if g.folder.is_empty() {
         games_dir()
     } else {
         games_dir().join(&g.folder)
     };
+
+    let steam = g.is_steam();
+    let mut steam_root: Option<PathBuf> = None;
+    if steam {
+        let Some((root, dir)) = steam_loc(g) else {
+            log.push("Refused: Steam folder not found or unsafe game folder name".to_string());
+            return (None, log);
+        };
+        match steam_state(g) {
+            SteamState::Foreign => {
+                log.push(format!(
+                    "Refused: {} exists and has no valid {MARKER_FILE}",
+                    dir.display()
+                ));
+                return (None, log);
+            }
+            SteamState::NoDir => {
+                if fs::create_dir_all(&dir).is_err() || !inside_root(&dir, &root) {
+                    log.push(format!("Failed to create folder {}", dir.display()));
+                    return (None, log);
+                }
+                if fs::write(dir.join(MARKER_FILE), MARKER_TEXT).is_err() {
+                    let _ = fs::remove_dir(&dir);
+                    log.push(format!("Failed to write {MARKER_FILE}"));
+                    return (None, log);
+                }
+                log.push(format!("Created folder: {}", dir.display()));
+            }
+            SteamState::Ours => {}
+            SteamState::Invalid => return (None, log),
+        }
+        base = dir.clone();
+        steam_root = Some(root);
+    }
 
     for rel in &g.exes {
         if !rel_is_safe(rel) {
@@ -309,9 +389,17 @@ pub fn launch_fake(g: &Game) -> (Option<u32>, Vec<String>) {
         }
 
         if let Some(p) = target.parent() {
-            create_dirs_tracked(p, &g.name);
-            if !inside_games(p) {
-                log.push(format!("Refused: {rel} resolves outside games folder"));
+            if steam {
+                let _ = fs::create_dir_all(p);
+            } else {
+                create_dirs_tracked(p, &g.name);
+            }
+            let outside = match &steam_root {
+                Some(r) => !inside_root(p, r),
+                None => !inside_games(p),
+            };
+            if outside {
+                log.push(format!("Refused: {rel} resolves outside allowed folder"));
                 continue;
             }
         }

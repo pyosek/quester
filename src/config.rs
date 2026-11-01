@@ -9,7 +9,10 @@ use std::{
 
 pub const APP_NAME: &str = "Quester";
 
-pub const VERSION: &str = "v1.1.0";
+pub const VERSION: &str = "v1.1.1";
+
+pub const MARKER_FILE: &str = "quester.txt";
+pub const MARKER_TEXT: &str = "by claude and yarok";
 
 pub const UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36";
 pub const DISCORD_DB_URL: &str = "https://discord.com/api/v9/applications/detectable";

@@ -3,5 +3,11 @@
     "name": "Firefox",
     "folder": "Mozilla Firefox",
     "exe": ["firefox.exe"]
+  },
+  {
+    "name": "EA SPORTS FC™ 27",
+    "type": "steam",
+    "folder": "EASPORTSFC27",
+    "exe": ["EA SPORTS FC™ 27.exe"]
   }
 ]
