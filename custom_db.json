@@ -7,7 +7,7 @@
   {
     "name": "EA SPORTS FC™ 27",
     "type": "steam",
-    "folder": "EASPORTSFC27",
-    "exe": ["EASPORTSFC27.exe"]
+    "folder": "EA SPORTS FC 27",
+    "exe": ["FC27.exe"]
   }
 ]
