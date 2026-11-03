@@ -9,7 +9,7 @@ use std::{
 
 pub const APP_NAME: &str = "Quester";
 
-pub const VERSION: &str = "v1.1.1";
+pub const VERSION: &str = "v1.2.0";
 
 pub const MARKER_FILE: &str = "quester.txt";
 pub const MARKER_TEXT: &str = "by claude and yarok";

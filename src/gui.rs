@@ -1,4 +1,5 @@
 use crate::{
+    badge::{self, BadgeCfg, BadgeShared},
     config::{exe_dir, games_dir, log_crash, now_ts, Msg, Notifier, APP_NAME, VERSION},
     discord::{self, Game},
     github,
@@ -11,8 +12,12 @@ use eframe::egui::{self, Color32, Margin, Rounding, Stroke};
 use std::{
     collections::HashMap,
     fs,
-    sync::mpsc::{channel, Receiver},
-    thread,
+    sync::{
+        atomic::Ordering,
+        mpsc::{channel, Receiver},
+        Arc,
+    },
+    thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
 
@@ -327,8 +332,25 @@ struct App {
     show_logs: bool,
     show_running: bool,
 
+    show_badge: bool,
+    badge_unlocked: bool,
+    badge_ack: bool,
+    badge_warn_since: Option<Instant>,
+    badge_cfg: BadgeCfg,
+    badge_shared: Arc<BadgeShared>,
+    badge_handle: Option<JoinHandle<()>>,
+
     pending_steam: Option<Game>,
     steam_cache: HashMap<String, (Instant, SteamState)>,
+}
+
+impl Drop for App {
+    fn drop(&mut self) {
+        self.badge_shared.cancel.store(true, Ordering::Relaxed);
+        if let Some(h) = self.badge_handle.take() {
+            let _ = h.join();
+        }
+    }
 }
 
 impl App {
@@ -370,6 +392,13 @@ impl App {
             alive_inflight: false,
             show_logs: false,
             show_running: false,
+            show_badge: false,
+            badge_unlocked: false,
+            badge_ack: false,
+            badge_warn_since: None,
+            badge_cfg: BadgeCfg::default(),
+            badge_shared: Arc::new(BadgeShared::default()),
+            badge_handle: None,
             pending_steam: None,
             steam_cache: HashMap::new(),
         }
@@ -654,6 +683,161 @@ impl App {
         }
     }
 
+    fn badge_running(&self) -> bool {
+        self.badge_shared.running.load(Ordering::Relaxed)
+    }
+
+    fn start_badge(&mut self) {
+        if self.badge_running() {
+            return;
+        }
+        if self.discord_games.is_empty() {
+            self.push_log("Badge: Discord DB not loaded yet");
+            return;
+        }
+        if let Some(h) = self.badge_handle.take() {
+            let _ = h.join();
+        }
+        self.badge_handle = Some(badge::start(
+            self.discord_games.clone(),
+            self.badge_cfg.clone(),
+            self.badge_shared.clone(),
+            self.notifier.clone(),
+        ));
+    }
+
+    fn window_badge(&mut self, ctx: &egui::Context) {
+        if !self.show_badge {
+            return;
+        }
+        let id = egui::ViewportId::from_hash_of("badge_window");
+        let vb = window_viewport(380.0, 440.0)
+            .with_title(format!("{APP_NAME} - get badge"))
+            .with_min_inner_size([320.0, 320.0]);
+        ctx.show_viewport_immediate(id, vb, |ctx, _| {
+            let running = self.badge_running();
+            let (mut start, mut stop, mut clear) = (false, false, false);
+            egui::CentralPanel::default()
+                .frame(egui::Frame::none().fill(BG).inner_margin(Margin::same(12.0)))
+                .show(ctx, |ui| {
+                    if !self.badge_unlocked && !running {
+                        let since = *self.badge_warn_since.get_or_insert_with(Instant::now);
+                        let left = 8u64.saturating_sub(since.elapsed().as_secs());
+                        ui.label(
+                            egui::RichText::new("Warning")
+                                .size(20.0)
+                                .strong()
+                                .color(Color32::from_rgb(0xe3, 0x26, 0x36)),
+                        );
+                        ui.label(
+                            "This can get your Discord account banned. Faking game activity \
+                             is against Discord's rules and the badge is not guaranteed. \
+                             You use it at your own risk.",
+                        );
+                        ui.checkbox(&mut self.badge_ack, "I understand the risk");
+                        let label = if left > 0 {
+                            format!("continue ({left})")
+                        } else {
+                            "continue".to_string()
+                        };
+                        let ready = self.badge_ack && left == 0;
+                        if ui
+                            .add_enabled(
+                                ready,
+                                egui::Button::new(label).min_size(egui::vec2(80.0, 0.0)),
+                            )
+                            .clicked()
+                        {
+                            self.badge_unlocked = true;
+                        }
+                        if left > 0 {
+                            ctx.request_repaint_after(Duration::from_millis(250));
+                        }
+                        return;
+                    }
+
+                    ui.add_enabled_ui(!running, |ui| {
+                        egui::Grid::new("badge_grid")
+                            .num_columns(2)
+                            .spacing([12.0, 8.0])
+                            .show(ui, |ui| {
+                                ui.label("batch size");
+                                ui.add(
+                                    egui::DragValue::new(&mut self.badge_cfg.batch)
+                                        .range(1..=20),
+                                );
+                                ui.end_row();
+                                ui.label("hold, sec");
+                                ui.add(
+                                    egui::DragValue::new(&mut self.badge_cfg.hold)
+                                        .range(5..=7200),
+                                );
+                                ui.end_row();
+                                ui.label("games (0 = all)");
+                                ui.add(
+                                    egui::DragValue::new(&mut self.badge_cfg.limit)
+                                        .range(0..=100000),
+                                );
+                                ui.end_row();
+                            });
+                        ui.checkbox(&mut self.badge_cfg.skip_history, "skip already done");
+                        ui.checkbox(&mut self.badge_cfg.lite, "lite windows");
+                    });
+
+                    ui.horizontal(|ui| {
+                        if running {
+                            if pill(ui, "stop").clicked() {
+                                stop = true;
+                            }
+                        } else {
+                            if pill(ui, "start").clicked() {
+                                start = true;
+                            }
+                            if pill(ui, "clear history").clicked() {
+                                clear = true;
+                            }
+                        }
+                    });
+
+                    let done = self.badge_shared.done.load(Ordering::Relaxed);
+                    let total = self.badge_shared.total.load(Ordering::Relaxed);
+                    if total > 0 {
+                        ui.label(format!("{done} / {total} games"));
+                        ui.add(egui::ProgressBar::new(done as f32 / total as f32));
+                    }
+                    let cur = self
+                        .badge_shared
+                        .current
+                        .lock()
+                        .map(|c| c.join(", "))
+                        .unwrap_or_default();
+                    if !cur.is_empty() {
+                        ui.label(egui::RichText::new(cur).small().color(DIM));
+                    }
+                    ui.label(
+                        egui::RichText::new(
+                            "Keep Quester open. Discord can take up to a day to update the badge.",
+                        )
+                        .small()
+                        .color(DIM),
+                    );
+                });
+            if start {
+                self.start_badge();
+            }
+            if stop {
+                self.badge_shared.cancel.store(true, Ordering::Relaxed);
+            }
+            if clear {
+                badge::history_clear();
+                self.push_log("Badge history cleared");
+            }
+            if ctx.input(|i| i.viewport().close_requested()) {
+                self.show_badge = false;
+            }
+        });
+    }
+
     fn window_logs(&mut self, ctx: &egui::Context) {
         if !self.show_logs {
             return;
@@ -745,7 +929,7 @@ impl eframe::App for App {
         self.poll_alive();
         self.refilter_if_needed();
 
-        if !self.running.is_empty() {
+        if !self.running.is_empty() || self.badge_running() {
             ctx.request_repaint_after(Duration::from_secs(1));
         }
 
@@ -762,6 +946,19 @@ impl eframe::App for App {
             .frame(egui::Frame::none().inner_margin(Margin::symmetric(20.0, 10.0)))
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
+                    if pill(ui, "get badge").clicked() {
+                        if self.show_badge {
+                            ctx.send_viewport_cmd_to(
+                                egui::ViewportId::from_hash_of("badge_window"),
+                                egui::ViewportCommand::Focus,
+                            );
+                        } else if !self.badge_running() {
+                            self.badge_unlocked = false;
+                            self.badge_ack = false;
+                            self.badge_warn_since = None;
+                        }
+                        self.show_badge = true;
+                    }
                     let label = format!("running ({})", self.running.len());
                     if pill(ui, &label).clicked() {
                         if self.show_running {
@@ -793,6 +990,7 @@ impl eframe::App for App {
             });
 
         self.window_running(ctx);
+        self.window_badge(ctx);
         self.window_logs(ctx);
         self.window_confirm(ctx);
     }
