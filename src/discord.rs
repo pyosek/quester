@@ -1,6 +1,7 @@
 use crate::config::{Msg, Notifier, DISCORD_DB_URL, UA};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use reqwest::header::{HeaderMap, HeaderValue, ACCEPT_ENCODING};
 use std::{thread, time::Duration};
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -93,9 +94,12 @@ fn safe_json_parse(resp: reqwest::blocking::Response) -> Result<Value, String> {
 }
 
 fn fetch(n: Notifier) {
+    let mut h = HeaderMap::new();
+    h.insert(ACCEPT_ENCODING, HeaderValue::from_static("identity"));
     let client = match reqwest::blocking::Client::builder()
         .user_agent(UA)
-        .timeout(Duration::from_secs(20))
+        .default_headers(h)
+        .timeout(Duration::from_secs(60))
         .build()
     {
         Ok(c) => c,

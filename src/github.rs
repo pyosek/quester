@@ -2,11 +2,15 @@ use crate::{
     config::{Msg, Notifier, GITHUB_DB_URL, UA},
     discord::Game,
 };
+use reqwest::header::{HeaderMap, HeaderValue, ACCEPT_ENCODING};
 use std::{thread, time::Duration};
 
 fn fetch(n: Notifier) {
+    let mut h = HeaderMap::new();
+    h.insert(ACCEPT_ENCODING, HeaderValue::from_static("identity"));
     let client = match reqwest::blocking::Client::builder()
         .user_agent(UA)
+        .default_headers(h)
         .timeout(Duration::from_secs(20))
         .build()
     {
