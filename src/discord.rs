@@ -24,26 +24,49 @@ impl Game {
     }
 }
 
-fn exes_for_app(app: &Value) -> Vec<String> {
-    let list = match app["executables"].as_array() {
-        Some(l) => l,
-        None => return vec![],
-    };
-    let mut c: Vec<(bool, String)> = list
-        .iter()
-        .filter(|e| e["os"] == "win32")
+#[cfg(windows)]
+const TARGET_OS: &str = "win32";
+#[cfg(target_os = "macos")]
+const TARGET_OS: &str = "darwin";
+#[cfg(all(unix, not(target_os = "macos")))]
+const TARGET_OS: &str = "linux";
+
+#[cfg(windows)]
+pub fn normalize_rel(s: &str) -> String {
+    s.to_string()
+}
+
+#[cfg(not(windows))]
+pub fn normalize_rel(s: &str) -> String {
+    s.replace('\\', "/")
+}
+
+fn collect_exes(list: &[Value], os: &str) -> Vec<(bool, String)> {
+    list.iter()
+        .filter(|e| e["os"] == os)
         .filter_map(|e| {
             let n = e["name"]
                 .as_str()?
                 .trim_start_matches('>')
-                .trim_start_matches(['/', '\\'])
-                .to_string();
+                .trim_start_matches(['/', '\\']);
+            let n = normalize_rel(n);
             if n.is_empty() || n.contains("..") || n.contains(':') {
                 return None;
             }
             Some((e["is_launcher"] == true, n))
         })
-        .collect();
+        .collect()
+}
+
+fn exes_for_app(app: &Value) -> Vec<String> {
+    let list = match app["executables"].as_array() {
+        Some(l) => l,
+        None => return vec![],
+    };
+    let mut c = collect_exes(list, TARGET_OS);
+    if c.is_empty() {
+        c = collect_exes(list, "win32");
+    }
     c.sort();
     c.dedup_by(|a, b| a.1 == b.1);
     let non: Vec<String> = c.iter().filter(|x| !x.0).map(|x| x.1.clone()).collect();

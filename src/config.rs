@@ -14,7 +14,10 @@ pub const VERSION: &str = "v1.2.1";
 pub const MARKER_FILE: &str = "quester.txt";
 pub const MARKER_TEXT: &str = "by claude and yarok";
 
+#[cfg(windows)]
 pub const UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36";
+#[cfg(not(windows))]
+pub const UA: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36";
 pub const DISCORD_DB_URL: &str = "https://discord.com/api/v9/applications/detectable";
 pub const GITHUB_DB_URL: &str =
     "https://raw.githubusercontent.com/pyosek/quester/refs/heads/main/custom_db.json";
@@ -30,16 +33,25 @@ pub fn games_dir() -> PathBuf {
     exe_dir().join("games")
 }
 
+#[cfg(windows)]
 #[link(name = "shell32")]
 extern "system" {
     fn SetCurrentProcessExplicitAppUserModelID(app_id: *const u16) -> i32;
 }
+
+#[cfg(windows)]
 pub fn set_app_id() {
-    let id: Vec<u16> = "Quester.App".encode_utf16().chain(std::iter::once(0)).collect();
+    let id: Vec<u16> = "Quester.App"
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
     unsafe {
         SetCurrentProcessExplicitAppUserModelID(id.as_ptr());
     }
 }
+
+#[cfg(not(windows))]
+pub fn set_app_id() {}
 
 pub fn now_ts() -> u64 {
     SystemTime::now()

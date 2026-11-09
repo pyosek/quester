@@ -16,37 +16,59 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  RUSTFLAGS: -C target-feature=+crt-static
 
 jobs:
-  release:
-    runs-on: windows-latest
-    timeout-minutes: 30
-    permissions:
-      contents: write
-
+  validate:
+    runs-on: ubuntu-latest
     steps:
       - name: Validate tag
-        shell: pwsh
         env:
           TAG: ${{ inputs.tag }}
         run: |
-          if ($env:TAG -notmatch '^v\d+\.\d+\.\d+(-[0-9A-Za-z.]+)?$') {
-            throw "Invalid tag '$env:TAG'"
-          }
+          if ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; then
+            echo "Invalid tag '$TAG'" >&2
+            exit 1
+          fi
 
+  build:
+    needs: validate
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            platform: windows
+          - os: ubuntu-latest
+            platform: linux
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    steps:
       - uses: actions/checkout@v4
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Install Linux dependencies
+        if: matrix.platform == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxkbcommon-dev libwayland-dev libx11-dev libxi-dev libgl1-mesa-dev
+
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
-      - name: Build
+      - name: Build (Windows)
+        if: matrix.platform == 'windows'
+        env:
+          RUSTFLAGS: -C target-feature=+crt-static
         run: cargo build --release
 
-      - name: Package
+      - name: Build (Linux)
+        if: matrix.platform == 'linux'
+        run: cargo build --release
+
+      - name: Package (Windows)
+        if: matrix.platform == 'windows'
         shell: pwsh
         env:
           TAG: ${{ inputs.tag }}
@@ -61,8 +83,37 @@ jobs:
 
           Copy-Item $exes.FullName -Destination $pkg
 
-          $zip = "dist/$env:NAME-$env:TAG.zip"
+          $zip = "dist/$env:NAME-$env:TAG-windows.zip"
           Compress-Archive -Path $pkg -DestinationPath $zip -Force
+
+      - name: Package (Linux)
+        if: matrix.platform == 'linux'
+        env:
+          TAG: ${{ inputs.tag }}
+          NAME: ${{ github.event.repository.name }}
+        run: |
+          mkdir -p "pkg/$NAME" dist
+          install -Dm755 target/release/quester "pkg/$NAME/quester"
+          tar -C pkg -czf "dist/$NAME-$TAG-linux.tar.gz" "$NAME"
+
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: quester-${{ matrix.platform }}
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download packages
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
 
       - name: Create Release and Upload Assets
         uses: softprops/action-gh-release@v2
@@ -70,8 +121,7 @@ jobs:
           tag_name: ${{ inputs.tag }}
           name: Release ${{ inputs.tag }}
           target_commitish: ${{ github.sha }}
-          files: |
-            dist/*.zip
+          files: dist/*
           fail_on_unmatched_files: true
           draft: false
           prerelease: ${{ inputs.prerelease }}
