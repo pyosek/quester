@@ -1,6 +1,6 @@
 use crate::{
     config::{Msg, Notifier, GITHUB_DB_URL, UA},
-    discord::Game,
+    discord::{normalize_rel, Game},
 };
 use reqwest::header::{HeaderMap, HeaderValue, ACCEPT_ENCODING};
 use std::{thread, time::Duration};
@@ -31,6 +31,9 @@ fn fetch(n: Notifier) {
         Ok(mut games) => {
             games.retain(|g| !g.exes.is_empty());
             for g in games.iter_mut() {
+                for e in g.exes.iter_mut() {
+                    *e = normalize_rel(e);
+                }
                 if g.name.trim().is_empty() {
                     g.name = format!("{}/{}", g.folder, g.exes[0]);
                 }

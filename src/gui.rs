@@ -42,12 +42,36 @@ fn setup_fonts(ctx: &egui::Context) {
     if let Ok(bytes) = fs::read(exe_dir().join("Skranji-Regular.ttf")) {
         fonts
             .font_data
-            .insert("skranji".to_owned(), egui::FontData::from_owned(bytes).into());
+            .insert("skranji".to_owned(), egui::FontData::from_owned(bytes));
         if let Some(f) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
             f.insert(0, "skranji".to_owned());
         }
     }
 
+    add_system_fonts(&mut fonts);
+
+    ctx.set_fonts(fonts);
+}
+
+fn push_font(fonts: &mut egui::FontDefinitions, key: &str, path: &std::path::Path) {
+    if fonts.font_data.contains_key(key) {
+        return;
+    }
+    let Ok(bytes) = fs::read(path) else {
+        return;
+    };
+    fonts
+        .font_data
+        .insert(key.to_owned(), egui::FontData::from_owned(bytes));
+    for fam in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+        if let Some(f) = fonts.families.get_mut(&fam) {
+            f.push(key.to_owned());
+        }
+    }
+}
+
+#[cfg(windows)]
+fn add_system_fonts(fonts: &mut egui::FontDefinitions) {
     let win = std::env::var("WINDIR").unwrap_or_else(|_| "C:\\Windows".to_string());
     let fallbacks = [
         ("sys_cjk_sc", "msyh.ttc"),
@@ -59,19 +83,61 @@ fn setup_fonts(ctx: &egui::Context) {
     ];
     for (key, file) in fallbacks {
         let path = std::path::Path::new(&win).join("Fonts").join(file);
-        if let Ok(bytes) = fs::read(&path) {
-            fonts
-                .font_data
-                .insert(key.to_owned(), egui::FontData::from_owned(bytes).into());
-            for fam in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
-                if let Some(f) = fonts.families.get_mut(&fam) {
-                    f.push(key.to_owned());
-                }
-            }
-        }
+        push_font(fonts, key, &path);
+    }
+}
+
+#[cfg(not(windows))]
+fn add_system_fonts(fonts: &mut egui::FontDefinitions) {
+    const FALLBACKS: &[(&str, &str)] = &[
+        ("sys_ui", "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"),
+        (
+            "sys_ui2",
+            "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+        ),
+        (
+            "sys_cjk",
+            "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        ),
+        (
+            "sys_cjk2",
+            "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+        ),
+        (
+            "sys_cjk3",
+            "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
+        ),
+        ("sys_cjk4", "/usr/share/fonts/truetype/arphic/uming.ttc"),
+    ];
+    for (key, path) in FALLBACKS {
+        push_font(fonts, key, std::path::Path::new(path));
     }
 
-    ctx.set_fonts(fonts);
+    // if not found, ask fontconfig for the default sans-serif face:
+    if let Ok(out) = std::process::Command::new("fc-match")
+        .args(["-f", "%{file}", "sans-serif"])
+        .output()
+    {
+        let p = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if !p.is_empty() {
+            push_font(fonts, "sys_fc_match", std::path::Path::new(&p));
+        }
+    }
+}
+
+fn open_path(path: &std::path::Path) -> std::io::Result<std::process::Child> {
+    #[cfg(windows)]
+    {
+        std::process::Command::new("explorer").arg(path).spawn()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open").arg(path).spawn()
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        std::process::Command::new("xdg-open").arg(path).spawn()
+    }
 }
 
 fn apply_theme(ctx: &egui::Context) {
@@ -86,33 +152,33 @@ fn apply_theme(ctx: &egui::Context) {
     v.override_text_color = None;
     v.hyperlink_color = TEXT;
     v.selection.bg_fill = Color32::from_rgb(0x4E, 0x4B, 0x58);
-    v.selection.stroke = Stroke::new(1.0, TEXT);
+    v.selection.stroke = Stroke::new(1.0_f32, TEXT);
 
     let r = Rounding::same(6.0);
     v.widgets.noninteractive.bg_fill = CARD;
-    v.widgets.noninteractive.bg_stroke = Stroke::new(1.0, BORDER_DIM);
-    v.widgets.noninteractive.fg_stroke = Stroke::new(1.0, TEXT);
+    v.widgets.noninteractive.bg_stroke = Stroke::new(1.0_f32, BORDER_DIM);
+    v.widgets.noninteractive.fg_stroke = Stroke::new(1.0_f32, TEXT);
     v.widgets.noninteractive.rounding = r;
 
     v.widgets.inactive.bg_fill = ROW;
     v.widgets.inactive.weak_bg_fill = Color32::TRANSPARENT;
-    v.widgets.inactive.bg_stroke = Stroke::new(1.0, BORDER_DIM);
-    v.widgets.inactive.fg_stroke = Stroke::new(1.0, TEXT);
+    v.widgets.inactive.bg_stroke = Stroke::new(1.0_f32, BORDER_DIM);
+    v.widgets.inactive.fg_stroke = Stroke::new(1.0_f32, TEXT);
     v.widgets.inactive.rounding = r;
 
     v.widgets.hovered.bg_fill = ROW;
     v.widgets.hovered.weak_bg_fill = Color32::from_rgb(30, 30, 34);
-    v.widgets.hovered.bg_stroke = Stroke::new(1.0, BORDER);
-    v.widgets.hovered.fg_stroke = Stroke::new(1.0, Color32::WHITE);
+    v.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, BORDER);
+    v.widgets.hovered.fg_stroke = Stroke::new(1.0_f32, Color32::WHITE);
     v.widgets.hovered.rounding = r;
 
     v.widgets.active.bg_fill = ROW;
     v.widgets.active.weak_bg_fill = Color32::from_rgb(40, 40, 46);
-    v.widgets.active.bg_stroke = Stroke::new(1.0, TEXT);
-    v.widgets.active.fg_stroke = Stroke::new(1.0, Color32::WHITE);
+    v.widgets.active.bg_stroke = Stroke::new(1.0_f32, TEXT);
+    v.widgets.active.fg_stroke = Stroke::new(1.0_f32, Color32::WHITE);
     v.widgets.active.rounding = r;
 
-    v.widgets.open.fg_stroke = Stroke::new(1.0, TEXT);
+    v.widgets.open.fg_stroke = Stroke::new(1.0_f32, TEXT);
     v.widgets.open.rounding = r;
 
     v.window_rounding = Rounding::same(20.0);
@@ -167,7 +233,7 @@ fn pill(ui: &mut egui::Ui, text: &str) -> egui::Response {
 fn card_frame() -> egui::Frame {
     egui::Frame::none()
         .fill(CARD)
-        .stroke(Stroke::new(2.0, BORDER))
+        .stroke(Stroke::new(2.0_f32, BORDER))
         .rounding(Rounding::same(20.0))
         .inner_margin(Margin::same(12.0))
         .shadow(egui::epaint::Shadow {
@@ -181,7 +247,7 @@ fn card_frame() -> egui::Frame {
 fn fake_card_frame() -> egui::Frame {
     egui::Frame::none()
         .fill(CARD)
-        .stroke(Stroke::new(2.0, BORDER))
+        .stroke(Stroke::new(2.0_f32, BORDER))
         .rounding(Rounding::same(16.0))
         .inner_margin(Margin::same(12.0))
 }
@@ -440,7 +506,7 @@ impl App {
             return;
         }
         if let Some(dir) = steam_dir(g) {
-            if let Err(e) = std::process::Command::new("explorer").arg(&dir).spawn() {
+            if let Err(e) = open_path(&dir) {
                 self.push_log(format!("Could not open folder: {e}"));
             }
         }
@@ -460,7 +526,7 @@ impl App {
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .show(ctx, |ui| {
                 ui.set_max_width(280.0);
-                ui.label(format!("An .exe will be created in {dir}."));
+                ui.label(format!("A fake game executable will be created in {dir}."));
                 ui.label(
                     egui::RichText::new("Delete the folder yourself afterwards.")
                         .color(Color32::from_rgb(0xe3, 0x26, 0x36)),
@@ -600,7 +666,7 @@ impl App {
                 if pill(ui, "folder").clicked() {
                     let dir = games_dir();
                     let _ = fs::create_dir_all(&dir);
-                    if let Err(e) = std::process::Command::new("explorer").arg(&dir).spawn() {
+                    if let Err(e) = open_path(&dir) {
                         self.push_log(format!("Could not open folder: {e}"));
                     }
                 }

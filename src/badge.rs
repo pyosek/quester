@@ -94,16 +94,21 @@ fn spawn_one(
     lite: bool,
     ttl: u64,
 ) -> Result<Child, String> {
-    let rel = &g.exes[0];
-    if !rel_is_safe(rel) {
+    let rel = crate::discord::normalize_rel(&g.exes[0]);
+    if !rel_is_safe(&rel) {
         return Err(format!("unsafe path: {rel}"));
     }
-    let target = root.join(slot.to_string()).join(rel);
+    let target = root.join(slot.to_string()).join(&rel);
     if let Some(p) = target.parent() {
         fs::create_dir_all(p).map_err(|e| format!("{}: {e}", g.name))?;
     }
     if fs::hard_link(me, &target).is_err() {
         fs::copy(me, &target).map_err(|e| format!("{}: copy failed: {e}", g.name))?;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&target, fs::Permissions::from_mode(0o755));
     }
     let mut c = Command::new(&target);
     if lite {

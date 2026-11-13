@@ -5,12 +5,28 @@ on:
 
 jobs:
   build:
-    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            artifact: quester-windows
+            path: target/release/*.exe
+          - os: ubuntu-latest
+            artifact: quester-linux
+            path: target/release/quester
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxkbcommon-dev libwayland-dev libx11-dev libxi-dev libgl1-mesa-dev
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
@@ -18,9 +34,25 @@ jobs:
       - name: Build
         run: cargo build --release
 
+      - name: Package .moon bundle
+        if: runner.os == 'Linux'
+        run: |
+          V="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)"
+          bash packaging/moon/build-moon-bundle.sh \
+            --version "$V" \
+            --output "dist/quester-$V-linux-x86_64.moon"
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: quester-windows
-          path: target/release/*.exe
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.path }}
+          if-no-files-found: error
+
+      - name: Upload .moon artifact
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: quester-linux-moon
+          path: dist/*.moon
           if-no-files-found: error
