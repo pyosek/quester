@@ -20,16 +20,6 @@ cargo build --release
 
 The binary is self-contained; it does not need the repository assets at runtime. On Debian/Ubuntu the build dependencies are `libxkbcommon-dev libwayland-dev libx11-dev libxi-dev libgl1-mesa-dev`.
 
-## Moon bundle (Linux)
-Quester can be packaged as a single `.moon` file and installed with the [moon](https://moonpkg.github.io/cli) CLI:
-
-```sh
-bash packaging/moon/build-moon-bundle.sh
-moon install dist/quester-<version>-linux-x86_64.moon
-```
-
-A `.moon` bundle is a plain `tar.gz` containing the binary, manifest, desktop entry and icon. See [`packaging/moon/README.md`](packaging/moon/README.md) for the format and options.
-
 ## Disclaimer
 This tool may violate Discord's Terms of Service and could put your account at risk. Use at your own risk. Not affiliated with or endorsed by Discord. Download only from this repository.
 

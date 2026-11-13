@@ -94,19 +94,7 @@ jobs:
         run: |
           mkdir -p "pkg/$NAME" dist
           install -Dm755 target/release/quester "pkg/$NAME/quester"
-          tar -C pkg -czf "dist/$NAME-$TAG-linux-x86_64.tar.gz" "$NAME"
-
-      - name: Package .moon bundle (Linux)
-        if: matrix.platform == 'linux'
-        env:
-          TAG: ${{ inputs.tag }}
-          NAME: ${{ github.event.repository.name }}
-        run: |
-          V="${TAG#v}"
-          bash packaging/moon/build-moon-bundle.sh \
-            --binary target/release/quester \
-            --version "$V" \
-            --output "dist/$NAME-$TAG-linux-x86_64.moon"
+          tar -C pkg -czf "dist/$NAME-$TAG-linux.tar.gz" "$NAME"
 
       - name: Upload package
         uses: actions/upload-artifact@v4
