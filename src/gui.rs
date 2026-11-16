@@ -1,16 +1,21 @@
 use crate::{
-    badge::{self, BadgeCfg, BadgeShared},
-    config::{exe_dir, games_dir, log_crash, now_ts, Msg, Notifier, APP_NAME, VERSION},
+    badge::{
+        self, BadgeCfg, BadgeShared, HoursCfg, HOURS_MAX, HOURS_MAX_TIME, HOURS_MAX_UNLIMITED,
+        MODE_GAMES, MODE_HOURS,
+    },
+    config::{
+        exe_dir, games_dir, log_crash, now_ts, Msg, Notifier, Settings, APP_NAME, VERSION,
+    },
     discord::{self, Game},
-    github,
+    update,
     process::{
-        alive_pids, kill_pid, launch_fake, pid_is_ours, running_load, running_save,
-        steam_dir, steam_needs_confirm, steam_state, RunningEntry, SteamState,
+        alive_of, ensure_games_marker, is_tiling_wm, kill_pid, launch_fake,
+        pid_is_ours, running_load, running_replace_normal, running_save, spawn_orphan_cleanup,
+        RunningEntry,
     },
 };
 use eframe::egui::{self, Color32, Margin, Rounding, Stroke};
 use std::{
-    collections::HashMap,
     fs,
     sync::{
         atomic::Ordering,
@@ -24,6 +29,18 @@ use std::{
 const LOGO_SMALL: &[u8] = include_bytes!("../assets/logo_64.png");
 const LOGO_FULL: &[u8] = include_bytes!("../assets/logo.png");
 
+const RAM_PER_GAME_MB: f32 = 0.1;
+const RAM_PER_HOURS_MB: f32 = 0.1;
+
+fn ram_label(count: usize, per_mb: f32) -> String {
+    let mb = count as f32 * per_mb;
+    if mb >= 1024.0 {
+        format!("~{:.1} GB RAM", mb / 1024.0)
+    } else {
+        format!("~{:.0} MB RAM", mb)
+    }
+}
+
 const ROW_CONTENT_H: f32 = 36.0;
 const ROW_H: f32 = ROW_CONTENT_H + 12.0;
 
@@ -34,95 +51,135 @@ const BORDER: Color32 = Color32::from_rgb(150, 150, 158);
 const BORDER_DIM: Color32 = Color32::from_rgb(60, 60, 66);
 const TEXT: Color32 = Color32::from_rgb(230, 230, 234);
 const DIM: Color32 = Color32::from_rgb(110, 110, 118);
-const GLOW: Color32 = Color32::from_rgba_premultiplied(30, 30, 32, 110);
+const GREEN: Color32 = Color32::from_rgb(0x4a, 0xde, 0x80);
+const RED: Color32 = Color32::from_rgb(0xff, 0x4d, 0x4d);
 
-fn setup_fonts(ctx: &egui::Context) {
+fn fonts_base() -> egui::FontDefinitions {
     let mut fonts = egui::FontDefinitions::default();
 
-    if let Ok(bytes) = fs::read(exe_dir().join("Skranji-Regular.ttf")) {
-        fonts
-            .font_data
-            .insert("skranji".to_owned(), egui::FontData::from_owned(bytes));
+    if let Some(data) = map_font(&exe_dir().join("Skranji-Regular.ttf"), 0) {
+        fonts.font_data.insert("skranji".to_owned(), data);
         if let Some(f) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
             f.insert(0, "skranji".to_owned());
         }
     }
 
-    add_system_fonts(&mut fonts);
+    fonts
+}
 
+fn add_system_fonts(fonts: &mut egui::FontDefinitions) {
+    for (key, path, index) in system_fonts() {
+        push_font(fonts, &key, &path, index);
+    }
+}
+
+fn setup_fonts(ctx: &egui::Context) {
+    let mut fonts = fonts_base();
+    add_system_fonts(&mut fonts);
     ctx.set_fonts(fonts);
 }
 
-fn push_font(fonts: &mut egui::FontDefinitions, key: &str, path: &std::path::Path) {
+fn spawn_fonts(n: &Notifier) {
+    let n = n.clone();
+    thread::spawn(move || {
+        let mut fonts = fonts_base();
+        add_system_fonts(&mut fonts);
+        n.send(Msg::Fonts(Box::new(fonts)));
+    });
+}
+
+fn map_font(path: &std::path::Path, index: u32) -> Option<egui::FontData> {
+    let file = fs::File::open(path).ok()?;
+    let map = unsafe { memmap2::Mmap::map(&file).ok()? };
+    let bytes: &'static [u8] = Box::leak(Box::new(map));
+    let mut data = egui::FontData::from_static(bytes);
+    data.index = index;
+    Some(data)
+}
+
+fn push_font(fonts: &mut egui::FontDefinitions, key: &str, path: &std::path::Path, index: u32) {
     if fonts.font_data.contains_key(key) {
         return;
     }
-    let Ok(bytes) = fs::read(path) else {
+    let Some(data) = map_font(path, index) else {
         return;
     };
-    fonts
-        .font_data
-        .insert(key.to_owned(), egui::FontData::from_owned(bytes));
-    for fam in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
-        if let Some(f) = fonts.families.get_mut(&fam) {
-            f.push(key.to_owned());
-        }
+    fonts.font_data.insert(key.to_owned(), data);
+    if let Some(f) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
+        f.push(key.to_owned());
     }
 }
 
 #[cfg(windows)]
-fn add_system_fonts(fonts: &mut egui::FontDefinitions) {
+fn system_fonts() -> Vec<(String, std::path::PathBuf, u32)> {
     let win = std::env::var("WINDIR").unwrap_or_else(|_| "C:\\Windows".to_string());
-    let fallbacks = [
-        ("sys_cjk_sc", "msyh.ttc"),
-        ("sys_cjk_jp", "YuGothM.ttc"),
-        ("sys_cjk_jp2", "meiryo.ttc"),
-        ("sys_cjk_kr", "malgun.ttf"),
-        ("sys_symbols", "seguisym.ttf"),
-        ("sys_ui", "segoeui.ttf"),
-    ];
-    for (key, file) in fallbacks {
-        let path = std::path::Path::new(&win).join("Fonts").join(file);
-        push_font(fonts, key, &path);
-    }
+    let dir = std::path::Path::new(&win).join("Fonts");
+    [
+        "msyh.ttc",
+        "msjh.ttc",
+        "YuGothM.ttc",
+        "meiryo.ttc",
+        "malgun.ttf",
+        "seguisym.ttf",
+        "segoeui.ttf",
+    ]
+    .iter()
+    .map(|f| (format!("sys_{f}"), dir.join(f), 0))
+    .collect()
 }
 
 #[cfg(not(windows))]
-fn add_system_fonts(fonts: &mut egui::FontDefinitions) {
-    const FALLBACKS: &[(&str, &str)] = &[
-        ("sys_ui", "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"),
-        (
-            "sys_ui2",
-            "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
-        ),
-        (
-            "sys_cjk",
-            "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
-        ),
-        (
-            "sys_cjk2",
-            "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
-        ),
-        (
-            "sys_cjk3",
-            "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
-        ),
-        ("sys_cjk4", "/usr/share/fonts/truetype/arphic/uming.ttc"),
-    ];
-    for (key, path) in FALLBACKS {
-        push_font(fonts, key, std::path::Path::new(path));
-    }
-
-    // if not found, ask fontconfig for the default sans-serif face:
-    if let Ok(out) = std::process::Command::new("fc-match")
-        .args(["-f", "%{file}", "sans-serif"])
+fn fc_match(query: &str) -> Option<(std::path::PathBuf, u32)> {
+    let out = std::process::Command::new("fc-match")
+        .args(["-f", "%{file}|%{index}", query])
         .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&out.stdout).to_string();
+    let (path, index) = text.rsplit_once('|')?;
+    let path = path.trim();
+    if path.is_empty() {
+        return None;
+    }
+    let index = index.trim().parse::<u32>().unwrap_or(0) & 0xFFFF;
+    Some((std::path::PathBuf::from(path), index))
+}
+
+#[cfg(not(windows))]
+fn system_fonts() -> Vec<(String, std::path::PathBuf, u32)> {
+    const STATIC: &[&str] = &[
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/OTF/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
+        "/usr/share/fonts/truetype/arphic/uming.ttc",
+    ];
+    let mut out: Vec<(String, std::path::PathBuf, u32)> = Vec::new();
+    for (i, query) in [
+        "sans-serif",
+        ":lang=ja",
+        ":lang=zh-cn",
+        ":lang=zh-tw",
+        ":lang=ko",
+    ]
+    .iter()
+    .enumerate()
     {
-        let p = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        if !p.is_empty() {
-            push_font(fonts, "sys_fc_match", std::path::Path::new(&p));
+        if let Some((path, index)) = fc_match(query) {
+            if !out.iter().any(|(_, p, x)| *p == path && *x == index) {
+                out.push((format!("sys_fc{i}"), path, index));
+            }
         }
     }
+    for (i, path) in STATIC.iter().enumerate() {
+        let path = std::path::PathBuf::from(path);
+        if path.is_file() && !out.iter().any(|(_, p, _)| *p == path) {
+            out.push((format!("sys_static{i}"), path, 0));
+        }
+    }
+    out
 }
 
 fn open_path(path: &std::path::Path) -> std::io::Result<std::process::Child> {
@@ -140,8 +197,12 @@ fn open_path(path: &std::path::Path) -> std::io::Result<std::process::Child> {
     }
 }
 
+fn open_url(url: &str) -> std::io::Result<std::process::Child> {
+    open_path(std::path::Path::new(url))
+}
+
 fn apply_theme(ctx: &egui::Context) {
-    setup_fonts(ctx);
+    ctx.set_fonts(fonts_base());
     ctx.options_mut(|o| o.zoom_with_keyboard = false);
 
     let mut v = egui::Visuals::dark();
@@ -186,6 +247,7 @@ fn apply_theme(ctx: &egui::Context) {
 
     ctx.set_visuals(v);
     ctx.style_mut(|s| {
+        s.animation_time = 0.0;
         s.spacing.item_spacing = egui::vec2(10.0, 8.0);
         s.spacing.button_padding = egui::vec2(8.0, 2.0);
         s.text_styles
@@ -206,11 +268,46 @@ fn load_logo(ctx: &egui::Context) -> Option<egui::TextureHandle> {
     Some(ctx.load_texture("quester_logo", img, egui::TextureOptions::LINEAR))
 }
 
+#[cfg(windows)]
+fn hide_main_from_taskbar() {
+    #[link(name = "user32")]
+    extern "system" {
+        fn FindWindowW(class: *const u16, title: *const u16) -> isize;
+        fn ShowWindow(h: isize, cmd: i32) -> i32;
+        #[cfg_attr(target_pointer_width = "64", link_name = "GetWindowLongPtrW")]
+        #[cfg_attr(target_pointer_width = "32", link_name = "GetWindowLongW")]
+        fn GetWindowLongPtr(h: isize, idx: i32) -> isize;
+        #[cfg_attr(target_pointer_width = "64", link_name = "SetWindowLongPtrW")]
+        #[cfg_attr(target_pointer_width = "32", link_name = "SetWindowLongW")]
+        fn SetWindowLongPtr(h: isize, idx: i32, v: isize) -> isize;
+    }
+    let title: Vec<u16> = APP_NAME.encode_utf16().chain(std::iter::once(0)).collect();
+    unsafe {
+        let hwnd = FindWindowW(std::ptr::null(), title.as_ptr());
+        if hwnd == 0 {
+            return;
+        }
+        const GWL_EXSTYLE: i32 = -20;
+        const WS_EX_TOOLWINDOW: isize = 0x80;
+        const WS_EX_APPWINDOW: isize = 0x0004_0000;
+        let ex = GetWindowLongPtr(hwnd, GWL_EXSTYLE);
+        ShowWindow(hwnd, 0);
+        SetWindowLongPtr(hwnd, GWL_EXSTYLE, (ex | WS_EX_TOOLWINDOW) & !WS_EX_APPWINDOW);
+        ShowWindow(hwnd, 4);
+    }
+}
+
+fn icon_cached() -> Option<egui::IconData> {
+    static ICON: std::sync::OnceLock<Option<egui::IconData>> = std::sync::OnceLock::new();
+    ICON.get_or_init(|| eframe::icon_data::from_png_bytes(LOGO_FULL).ok())
+        .clone()
+}
+
 fn window_viewport(w: f32, h: f32) -> egui::ViewportBuilder {
     let mut vb = egui::ViewportBuilder::default()
         .with_title(APP_NAME)
         .with_inner_size([w, h]);
-    if let Ok(icon) = eframe::icon_data::from_png_bytes(LOGO_FULL) {
+    if let Some(icon) = icon_cached() {
         vb = vb.with_icon(icon);
     }
     vb
@@ -236,12 +333,6 @@ fn card_frame() -> egui::Frame {
         .stroke(Stroke::new(2.0_f32, BORDER))
         .rounding(Rounding::same(20.0))
         .inner_margin(Margin::same(12.0))
-        .shadow(egui::epaint::Shadow {
-            offset: egui::vec2(0.0, 0.0),
-            blur: 30.0,
-            spread: 2.0,
-            color: GLOW,
-        })
 }
 
 fn fake_card_frame() -> egui::Frame {
@@ -260,18 +351,11 @@ fn row_frame() -> egui::Frame {
 }
 
 fn name_label(ui: &mut egui::Ui, name: &str) {
-    let mut job = egui::text::LayoutJob::single_section(
-        name.to_owned(),
-        egui::TextFormat {
-            font_id: egui::FontId::proportional(13.5),
-            color: TEXT,
-            ..Default::default()
-        },
-    );
-    job.wrap.max_rows = 2;
-    job.wrap.break_anywhere = true;
-    job.wrap.overflow_character = Some('…');
-    ui.add(egui::Label::new(job).wrap()).on_hover_text(name);
+    ui.add(
+        egui::Label::new(egui::RichText::new(name).size(13.5).color(TEXT))
+            .truncate(),
+    )
+    .on_hover_text(name);
 }
 
 fn list_row(ui: &mut egui::Ui, name: &str, action: Option<&str>) -> bool {
@@ -298,72 +382,35 @@ fn list_row(ui: &mut egui::Ui, name: &str, action: Option<&str>) -> bool {
     clicked
 }
 
-fn steam_row(
-    ui: &mut egui::Ui,
-    name: &str,
-    running: bool,
-    can_run: bool,
-    folder_ok: bool,
-) -> (bool, bool) {
-    let (mut run, mut folder) = (false, false);
-    row_frame().show(ui, |ui| {
-        ui.set_width(ui.available_width());
-        ui.set_height(ROW_CONTENT_H);
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if running {
-                ui.label(egui::RichText::new("running").color(DIM));
-            } else {
-                let r = ui
-                    .add_enabled(
-                        can_run,
-                        egui::Button::new(egui::RichText::new("run").size(13.0))
-                            .min_size(egui::vec2(46.0, 0.0)),
-                    )
-                    .on_hover_cursor(egui::CursorIcon::PointingHand)
-                    .on_disabled_hover_text(
-                        "Folder exists and was not created by Quester, or Steam was not found",
-                    );
-                if r.clicked() {
-                    run = true;
-                }
-            }
-            let fr = ui
-                .add_enabled(
-                    folder_ok,
-                    egui::Button::new(egui::RichText::new("folder").size(13.0))
-                        .min_size(egui::vec2(46.0, 0.0)),
-                )
-                .on_hover_cursor(egui::CursorIcon::PointingHand)
-                .on_disabled_hover_text("Folder doesn't exist yet or has no valid quester.txt");
-            if fr.clicked() {
-                folder = true;
-            }
-            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                name_label(ui, name);
-            });
-        });
-    });
-    (run, folder)
-}
-
-fn cached_state(
-    cache: &mut HashMap<String, (Instant, SteamState)>,
-    g: &Game,
-) -> SteamState {
-    if let Some((t, s)) = cache.get(&g.folder) {
-        if t.elapsed() < Duration::from_millis(1500) {
-            return *s;
-        }
-    }
-    let s = steam_state(g);
-    cache.insert(g.folder.clone(), (Instant::now(), s));
-    s
-}
-
 #[derive(Clone, Copy, PartialEq)]
 enum Tab {
     DiscordDb,
-    GithubDb,
+    Settings,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum FarmTab {
+    Games,
+    Hours,
+}
+
+enum FarmAction {
+    None,
+    StartGames,
+    StartHours,
+    Stop,
+    ClearHistory,
+}
+
+fn fmt_left(secs: u64) -> String {
+    let (h, m) = (secs / 3600, (secs % 3600) / 60);
+    if h > 0 {
+        format!("{h}h {m}m left")
+    } else if secs >= 60 {
+        format!("{m}m left")
+    } else {
+        format!("{secs}s left")
+    }
 }
 
 struct RunningGame {
@@ -378,7 +425,6 @@ struct App {
     logo: Option<egui::TextureHandle>,
 
     discord_games: Vec<Game>,
-    github_games: Vec<Game>,
     tab: Tab,
 
     search: String,
@@ -403,11 +449,17 @@ struct App {
     badge_ack: bool,
     badge_warn_since: Option<Instant>,
     badge_cfg: BadgeCfg,
+    hours_cfg: HoursCfg,
+    farm_tab: FarmTab,
     badge_shared: Arc<BadgeShared>,
     badge_handle: Option<JoinHandle<()>>,
 
-    pending_steam: Option<Game>,
-    steam_cache: HashMap<String, (Instant, SteamState)>,
+    settings: Settings,
+    update: Option<(String, String)>,
+    update_status: String,
+    update_inflight: bool,
+
+    main_hidden: bool,
 }
 
 impl Drop for App {
@@ -416,21 +468,34 @@ impl Drop for App {
         if let Some(h) = self.badge_handle.take() {
             let _ = h.join();
         }
+        if is_tiling_wm() {
+            for g in &self.running {
+                if pid_is_ours(g.pid) {
+                    kill_pid(g.pid);
+                }
+            }
+            running_replace_normal(&[]);
+        }
     }
 }
 
 impl App {
     fn new(ctx: egui::Context) -> Self {
         let (tx, rx) = channel();
+        ensure_games_marker(false);
 
+        let launch_ts = now_ts();
         let mut entries = running_load();
-        if let Some(alive) = alive_pids() {
+        let entry_pids: Vec<u32> = entries.iter().map(|e| e.pid).collect();
+        if let Some(alive) = alive_of(&entry_pids) {
             entries.retain(|e| alive.contains(&e.pid));
         }
-        entries.retain(|e| pid_is_ours(e.pid));
+        entries.retain(|e| e.hours || pid_is_ours(e.pid));
         running_save(&entries);
+        spawn_orphan_cleanup(launch_ts);
         let running = entries
             .into_iter()
+            .filter(|e| !e.hours)
             .map(|e| RunningGame {
                 app_name: e.app_name,
                 start_ts: e.start_ts,
@@ -443,7 +508,6 @@ impl App {
             apps_requested: false,
             logo: None,
             discord_games: vec![],
-            github_games: vec![],
             tab: Tab::DiscordDb,
             search: String::new(),
             filtered: vec![],
@@ -463,11 +527,25 @@ impl App {
             badge_ack: false,
             badge_warn_since: None,
             badge_cfg: BadgeCfg::default(),
+            hours_cfg: HoursCfg::default(),
+            farm_tab: FarmTab::Games,
             badge_shared: Arc::new(BadgeShared::default()),
             badge_handle: None,
-            pending_steam: None,
-            steam_cache: HashMap::new(),
+            settings: Settings::load(),
+            update: None,
+            update_status: String::new(),
+            update_inflight: false,
+            main_hidden: false,
         }
+    }
+
+    fn check_updates(&mut self) {
+        if self.settings.hide_updates || self.update_inflight {
+            return;
+        }
+        self.update_inflight = true;
+        self.update_status = "Checking...".to_string();
+        update::spawn_check(&self.notifier);
     }
 
     fn push_log(&mut self, s: impl Into<String>) {
@@ -485,69 +563,34 @@ impl App {
                 pid: g.pid,
                 app_name: g.app_name.clone(),
                 start_ts: g.start_ts,
+                hours: false,
             })
             .collect();
-        running_save(&v);
+        running_replace_normal(&v);
     }
 
     fn load_games(&mut self) {
-        self.push_log("Refreshing Discord DB and GitHub DB...");
+        self.push_log("Refreshing Discord DB...");
         discord::spawn_refresh(&self.notifier);
-        github::spawn_refresh(&self.notifier);
     }
 
     fn is_running(&self, name: &str) -> bool {
         self.running.iter().any(|g| g.app_name == name)
     }
 
-    fn open_game_folder(&mut self, g: &Game) {
-        if steam_state(g) != SteamState::Ours {
-            self.push_log("Folder is not a Quester folder, not opening");
-            return;
+    fn window_close(&mut self, ctx: &egui::Context) {
+        if ctx.input(|i| i.viewport().close_requested()) && !self.main_hidden && self.show_badge {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(
+                -32000.0, -32000.0,
+            )));
+            #[cfg(windows)]
+            hide_main_from_taskbar();
+            self.main_hidden = true;
         }
-        if let Some(dir) = steam_dir(g) {
-            if let Err(e) = open_path(&dir) {
-                self.push_log(format!("Could not open folder: {e}"));
-            }
-        }
-    }
-
-    fn window_confirm(&mut self, ctx: &egui::Context) {
-        let Some(g) = self.pending_steam.clone() else {
-            return;
-        };
-        let dir = steam_dir(&g)
-            .map(|d| d.display().to_string())
-            .unwrap_or_default();
-        let mut decision = None;
-        egui::Window::new(APP_NAME)
-            .collapsible(false)
-            .resizable(false)
-            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-            .show(ctx, |ui| {
-                ui.set_max_width(280.0);
-                ui.label(format!("A fake game executable will be created in {dir}."));
-                ui.label(
-                    egui::RichText::new("Delete the folder yourself afterwards.")
-                        .color(Color32::from_rgb(0xe3, 0x26, 0x36)),
-                );
-                ui.add_space(6.0);
-                ui.horizontal(|ui| {
-                    if pill(ui, "OK").clicked() {
-                        decision = Some(true);
-                    }
-                    if pill(ui, "Cancel").clicked() {
-                        decision = Some(false);
-                    }
-                });
-            });
-        match decision {
-            Some(true) => {
-                self.pending_steam = None;
-                self.run_fake_discord(g);
-            }
-            Some(false) => self.pending_steam = None,
-            None => {}
+        if self.main_hidden && !self.show_badge {
+            self.main_hidden = false;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
     }
 
@@ -555,8 +598,7 @@ impl App {
         if self.is_running(&g.name) {
             return;
         }
-        self.steam_cache.clear();
-        let (pid, lines) = launch_fake(&g);
+        let (pid, lines) = launch_fake(&g, self.settings.lite);
         for l in lines {
             self.push_log(l);
         }
@@ -590,27 +632,23 @@ impl App {
     fn poll_alive(&mut self) {
         if self.running.is_empty()
             || self.alive_inflight
-            || self.last_check.elapsed() < Duration::from_secs(3)
+            || self.last_check.elapsed() < Duration::from_secs(5)
         {
             return;
         }
         self.last_check = Instant::now();
         self.alive_inflight = true;
         let n = self.notifier.clone();
-        thread::spawn(move || n.send(Msg::Alive(alive_pids())));
+        let pids: Vec<u32> = self.running.iter().map(|g| g.pid).collect();
+        thread::spawn(move || n.send(Msg::Alive(alive_of(&pids))));
     }
 
-    fn drain_messages(&mut self) {
+    fn drain_messages(&mut self, ctx: &egui::Context) {
         while let Ok(m) = self.rx.try_recv() {
             match m {
                 Msg::DiscordGames(g) => {
                     self.push_log(format!("Discord DB loaded: {} games", g.len()));
                     self.discord_games = g;
-                    self.filter_dirty = true;
-                }
-                Msg::GithubGames(g) => {
-                    self.push_log(format!("GitHub DB loaded: {} games", g.len()));
-                    self.github_games = g;
                     self.filter_dirty = true;
                 }
                 Msg::Alive(list) => {
@@ -624,6 +662,27 @@ impl App {
                         }
                     }
                 }
+                Msg::UpdateChecked(r) => {
+                    self.update_inflight = false;
+                    if self.settings.hide_updates {
+                        continue;
+                    }
+                    match r {
+                        Ok(Some((tag, url))) => {
+                            self.push_log(format!("New version available: {tag}"));
+                            self.update_status = format!("New version: {tag}");
+                            self.update = Some((tag, url));
+                        }
+                        Ok(None) => {
+                            self.update_status = "You have the latest version".to_string();
+                        }
+                        Err(e) => {
+                            self.update_status = "Check failed".to_string();
+                            self.push_log(format!("Update check: {e}"));
+                        }
+                    }
+                }
+                Msg::Fonts(f) => ctx.set_fonts(*f),
                 Msg::Log(s) => self.push_log(s),
             }
         }
@@ -633,12 +692,14 @@ impl App {
         if !self.filter_dirty && self.search == self.last_search && self.tab == self.last_tab {
             return;
         }
+        if self.tab == Tab::Settings {
+            self.last_tab = self.tab;
+            self.filter_dirty = false;
+            return;
+        }
         let q = self.search.to_lowercase();
-        let src = match self.tab {
-            Tab::DiscordDb => &self.discord_games,
-            Tab::GithubDb => &self.github_games,
-        };
-        self.filtered = src
+        self.filtered = self
+            .discord_games
             .iter()
             .enumerate()
             .filter(|(_, g)| q.is_empty() || g.lname.contains(&q))
@@ -657,7 +718,33 @@ impl App {
             ui.vertical(|ui| {
                 ui.spacing_mut().item_spacing.y = 0.0;
                 ui.heading(egui::RichText::new(APP_NAME).strong());
-                ui.label(egui::RichText::new(VERSION).small().color(DIM));
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 6.0;
+                    ui.label(egui::RichText::new(VERSION).small().color(DIM));
+                    let shown = if self.settings.hide_updates {
+                        None
+                    } else {
+                        self.update.clone()
+                    };
+                    if let Some((tag, url)) = shown {
+                        let r = ui
+                            .add(
+                                egui::Label::new(
+                                    egui::RichText::new(format!("new update {tag}"))
+                                        .small()
+                                        .color(GREEN),
+                                )
+                                .sense(egui::Sense::click()),
+                            )
+                            .on_hover_cursor(egui::CursorIcon::PointingHand)
+                            .on_hover_text("open release page");
+                        if r.clicked() {
+                            if let Err(e) = open_url(&url) {
+                                self.push_log(format!("Could not open link: {e}"));
+                            }
+                        }
+                    }
+                });
             });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if pill(ui, "refresh").clicked() {
@@ -675,27 +762,82 @@ impl App {
 
         ui.horizontal_wrapped(|ui| {
             let d = format!("Discord ({})", self.discord_games.len());
-            let c = format!("GitHub ({})", self.github_games.len());
-            for (tab, label) in [(Tab::DiscordDb, d), (Tab::GithubDb, c)] {
+            let st = "settings".to_string();
+            for (tab, label) in [(Tab::DiscordDb, d), (Tab::Settings, st)] {
                 if tab_button(ui, &label, self.tab == tab).clicked() {
                     self.tab = tab;
                 }
             }
         });
 
-        ui.add(
-            egui::TextEdit::singleline(&mut self.search)
-                .hint_text("search game...")
-                .desired_width(f32::INFINITY)
-                .margin(egui::vec2(10.0, 6.0)),
+        if self.tab != Tab::Settings {
+            ui.add(
+                egui::TextEdit::singleline(&mut self.search)
+                    .hint_text("search game...")
+                    .desired_width(f32::INFINITY)
+                    .margin(egui::vec2(10.0, 6.0)),
+            );
+        }
+    }
+
+    fn ui_settings(&mut self, ui: &mut egui::Ui) {
+        let mut changed = false;
+        changed |= ui
+            .checkbox(&mut self.settings.lite, "lite windows")
+            .changed();
+        ui.label(
+            egui::RichText::new(
+                "Games you run yourself use a tiny window and much less RAM. \
+                 Farming always uses hidden lite windows, regardless of this option.",
+            )
+            .small()
+            .color(DIM),
         );
+        ui.add_space(8.0);
+        let hide = ui
+            .checkbox(&mut self.settings.hide_updates, "hide updates")
+            .changed();
+        ui.label(
+            egui::RichText::new(
+                "When on, Quester doesn't check for new versions and sends no request.",
+            )
+            .small()
+            .color(DIM),
+        );
+        if hide {
+            changed = true;
+            if self.settings.hide_updates {
+                self.update = None;
+                self.update_status.clear();
+            } else {
+                self.check_updates();
+            }
+        }
+        if !self.settings.hide_updates {
+            ui.horizontal(|ui| {
+                if pill(ui, "check now").clicked() {
+                    self.check_updates();
+                }
+                if !self.update_status.is_empty() {
+                    let color = if self.update.is_some() { GREEN } else { DIM };
+                    ui.label(egui::RichText::new(&self.update_status).small().color(color));
+                }
+            });
+            if let Some((_, url)) = self.update.clone() {
+                if pill(ui, "open release page").clicked() {
+                    if let Err(e) = open_url(&url) {
+                        self.push_log(format!("Could not open link: {e}"));
+                    }
+                }
+            }
+        }
+        if changed {
+            self.settings.save();
+        }
     }
 
     fn ui_games(&mut self, ui: &mut egui::Ui) {
-        let source = match self.tab {
-            Tab::DiscordDb => &self.discord_games,
-            Tab::GithubDb => &self.github_games,
-        };
+        let source = &self.discord_games;
         let total = self.filtered.len();
 
         if source.is_empty() {
@@ -705,47 +847,24 @@ impl App {
         }
 
         let mut to_run = None;
-        let mut to_folder = None;
         egui::ScrollArea::vertical()
             .id_salt("games_scroll")
             .auto_shrink([false, false])
+            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
             .show_rows(ui, ROW_H, total, |ui, range| {
                 for i in range {
                     let Some(&gi) = self.filtered.get(i) else { break };
                     let Some(g) = source.get(gi) else { continue };
                     let running = self.running.iter().any(|r| r.app_name == g.name);
-                    if g.is_steam() {
-                        let st = cached_state(&mut self.steam_cache, g);
-                        let can_run = !matches!(st, SteamState::Foreign | SteamState::Invalid);
-                        let (r, f) =
-                            steam_row(ui, &g.name, running, can_run, st == SteamState::Ours);
-                        if r {
-                            to_run = Some(gi);
-                        }
-                        if f {
-                            to_folder = Some(gi);
-                        }
-                    } else {
-                        let action = if running { None } else { Some("run") };
-                        if list_row(ui, &g.name, action) {
-                            to_run = Some(gi);
-                        }
+                    let action = if running { None } else { Some("run") };
+                    if list_row(ui, &g.name, action) {
+                        to_run = Some(gi);
                     }
                 }
             });
 
-        let run_game = to_run.and_then(|gi| source.get(gi).cloned());
-        let folder_game = to_folder.and_then(|gi| source.get(gi).cloned());
-
-        if let Some(g) = run_game {
-            if g.is_steam() && steam_needs_confirm(&g) {
-                self.pending_steam = Some(g);
-            } else {
-                self.run_fake_discord(g);
-            }
-        }
-        if let Some(g) = folder_game {
-            self.open_game_folder(&g);
+        if let Some(g) = to_run.and_then(|gi| source.get(gi).cloned()) {
+            self.run_fake_discord(g);
         }
     }
 
@@ -772,23 +891,194 @@ impl App {
         ));
     }
 
+    fn start_hours(&mut self) {
+        if self.badge_running() {
+            return;
+        }
+        if self.discord_games.is_empty() {
+            self.push_log("Hours: Discord DB not loaded yet");
+            return;
+        }
+        if let Some(h) = self.badge_handle.take() {
+            let _ = h.join();
+        }
+        self.badge_handle = Some(badge::start_hours(
+            self.discord_games.clone(),
+            self.hours_cfg.clone(),
+            self.badge_shared.clone(),
+            self.notifier.clone(),
+        ));
+    }
+
+    fn ui_farm_games(&mut self, ui: &mut egui::Ui, running: bool, mine: bool) -> FarmAction {
+        let mut action = FarmAction::None;
+        ui.add_enabled_ui(!running, |ui| {
+            egui::Grid::new("badge_grid")
+                .num_columns(2)
+                .spacing([12.0, 8.0])
+                .show(ui, |ui| {
+                    ui.label("batch size");
+                    ui.horizontal(|ui| {
+                        ui.add(egui::DragValue::new(&mut self.badge_cfg.batch).range(1..=20));
+                        ui.label(
+                            egui::RichText::new(ram_label(self.badge_cfg.batch, RAM_PER_GAME_MB))
+                                .small()
+                                .color(DIM),
+                        );
+                    });
+                    ui.end_row();
+                    ui.label("hold, sec");
+                    ui.add(egui::DragValue::new(&mut self.badge_cfg.hold).range(5..=7200));
+                    ui.end_row();
+                    ui.label("games (0 = all)");
+                    ui.add(egui::DragValue::new(&mut self.badge_cfg.limit).range(0..=100000));
+                    ui.end_row();
+                });
+            ui.checkbox(&mut self.badge_cfg.skip_history, "skip already done");
+        });
+
+        ui.horizontal(|ui| {
+            if running {
+                if pill(ui, "stop").clicked() {
+                    action = FarmAction::Stop;
+                }
+            } else {
+                if pill(ui, "start").clicked() {
+                    action = FarmAction::StartGames;
+                }
+                if pill(ui, "clear history").clicked() {
+                    action = FarmAction::ClearHistory;
+                }
+            }
+        });
+
+        if running && !mine {
+            ui.label(
+                egui::RichText::new("Farm hours is running. Stop it first.")
+                    .small()
+                    .color(DIM),
+            );
+            return action;
+        }
+        let done = self.badge_shared.done.load(Ordering::Relaxed);
+        let total = self.badge_shared.total.load(Ordering::Relaxed);
+        if mine && total > 0 {
+            ui.label(format!("{done} / {total} games"));
+            ui.add(egui::ProgressBar::new(done as f32 / total as f32));
+        }
+        let cur = self
+            .badge_shared
+            .current
+            .lock()
+            .map(|c| c.join(", "))
+            .unwrap_or_default();
+        if !cur.is_empty() {
+            ui.label(egui::RichText::new(cur).small().color(DIM));
+        }
+        ui.label(
+            egui::RichText::new(
+                "Keep Quester open. Discord can take up to a day to update the badge.",
+            )
+            .small()
+            .color(DIM),
+        );
+        action
+    }
+
+    fn ui_farm_hours(&mut self, ui: &mut egui::Ui, running: bool, mine: bool) -> FarmAction {
+        let mut action = FarmAction::None;
+        let max = if self.hours_cfg.unlimited {
+            HOURS_MAX_UNLIMITED
+        } else {
+            HOURS_MAX
+        };
+        self.hours_cfg.count = self.hours_cfg.count.clamp(1, max);
+
+        ui.add_enabled_ui(!running, |ui| {
+            egui::Grid::new("hours_grid")
+                .num_columns(2)
+                .spacing([12.0, 8.0])
+                .show(ui, |ui| {
+                    ui.label("games at once");
+                    ui.horizontal(|ui| {
+                        ui.add(egui::DragValue::new(&mut self.hours_cfg.count).range(1..=max));
+                        ui.label(
+                            egui::RichText::new(ram_label(self.hours_cfg.count, RAM_PER_HOURS_MB))
+                                .small()
+                                .color(DIM),
+                        );
+                    });
+                    ui.end_row();
+                    ui.label("hours");
+                    ui.add(
+                        egui::DragValue::new(&mut self.hours_cfg.hours).range(1..=HOURS_MAX_TIME),
+                    );
+                    ui.end_row();
+                });
+            ui.checkbox(
+                &mut self.hours_cfg.unlimited,
+                format!("no game limit (up to {HOURS_MAX_UNLIMITED})"),
+            );
+        });
+
+        ui.horizontal(|ui| {
+            if running {
+                if pill(ui, "stop").clicked() {
+                    action = FarmAction::Stop;
+                }
+            } else if pill(ui, "start").clicked() {
+                action = FarmAction::StartHours;
+            }
+        });
+
+        if running && !mine {
+            ui.label(
+                egui::RichText::new("Farm games is running. Stop it first.")
+                    .small()
+                    .color(DIM),
+            );
+            return action;
+        }
+        let dur = self.badge_shared.duration.load(Ordering::Relaxed);
+        if running && dur > 0 {
+            let start = self.badge_shared.start_ts.load(Ordering::Relaxed);
+            let el = now_ts().saturating_sub(start).min(dur);
+            let n = self.badge_shared.total.load(Ordering::Relaxed);
+            ui.label(format!("{n} games, {}", fmt_left(dur - el)));
+            ui.add(egui::ProgressBar::new(el as f32 / dur as f32));
+        }
+        ui.label(egui::RichText::new("PC may lag if you run many games").color(RED));
+        ui.label(
+            egui::RichText::new(
+                "Keep Quester open. Discord can take up to a day to update the badge",
+            )
+            .small()
+            .color(DIM),
+        );
+        action
+    }
+
     fn window_badge(&mut self, ctx: &egui::Context) {
         if !self.show_badge {
             return;
         }
         let id = egui::ViewportId::from_hash_of("badge_window");
-        let vb = window_viewport(380.0, 440.0)
-            .with_title(format!("{APP_NAME} - get badge"))
+        let vb = window_viewport(320.0, 320.0)
+            .with_title(format!("{APP_NAME} - farm badges"))
             .with_min_inner_size([320.0, 320.0]);
         ctx.show_viewport_immediate(id, vb, |ctx, _| {
             let running = self.badge_running();
-            let (mut start, mut stop, mut clear) = (false, false, false);
+            let mine_mode = if self.farm_tab == FarmTab::Games {
+                MODE_GAMES
+            } else {
+                MODE_HOURS
+            };
+            let mine = self.badge_shared.mode.load(Ordering::Relaxed) == mine_mode;
+            let mut action = FarmAction::None;
             egui::CentralPanel::default()
                 .frame(egui::Frame::none().fill(BG).inner_margin(Margin::same(12.0)))
                 .show(ctx, |ui| {
                     if !self.badge_unlocked && !running {
-                        let since = *self.badge_warn_since.get_or_insert_with(Instant::now);
-                        let left = 8u64.saturating_sub(since.elapsed().as_secs());
                         ui.label(
                             egui::RichText::new("Warning")
                                 .size(20.0)
@@ -801,7 +1091,15 @@ impl App {
                              You use it at your own risk.",
                         );
                         ui.checkbox(&mut self.badge_ack, "I understand the risk");
-                        let label = if left > 0 {
+                        let left = if self.badge_ack {
+                            let since = *self.badge_warn_since.get_or_insert_with(Instant::now);
+                            3u64.saturating_sub(since.elapsed().as_secs())
+                        } else {
+                            self.badge_warn_since = None;
+                            3
+                        };
+                        let counting = self.badge_ack && left > 0;
+                        let label = if counting {
                             format!("continue ({left})")
                         } else {
                             "continue".to_string()
@@ -810,93 +1108,46 @@ impl App {
                         if ui
                             .add_enabled(
                                 ready,
-                                egui::Button::new(label).min_size(egui::vec2(80.0, 0.0)),
+                                egui::Button::new(egui::RichText::new(label).size(13.0))
+                                    .min_size(egui::vec2(46.0, 0.0)),
                             )
+                            .on_hover_cursor(egui::CursorIcon::PointingHand)
                             .clicked()
                         {
                             self.badge_unlocked = true;
                         }
-                        if left > 0 {
+                        if counting {
                             ctx.request_repaint_after(Duration::from_millis(250));
                         }
                         return;
                     }
 
-                    ui.add_enabled_ui(!running, |ui| {
-                        egui::Grid::new("badge_grid")
-                            .num_columns(2)
-                            .spacing([12.0, 8.0])
-                            .show(ui, |ui| {
-                                ui.label("batch size");
-                                ui.add(
-                                    egui::DragValue::new(&mut self.badge_cfg.batch)
-                                        .range(1..=20),
-                                );
-                                ui.end_row();
-                                ui.label("hold, sec");
-                                ui.add(
-                                    egui::DragValue::new(&mut self.badge_cfg.hold)
-                                        .range(5..=7200),
-                                );
-                                ui.end_row();
-                                ui.label("games (0 = all)");
-                                ui.add(
-                                    egui::DragValue::new(&mut self.badge_cfg.limit)
-                                        .range(0..=100000),
-                                );
-                                ui.end_row();
-                            });
-                        ui.checkbox(&mut self.badge_cfg.skip_history, "skip already done");
-                        ui.checkbox(&mut self.badge_cfg.lite, "lite windows");
-                    });
-
                     ui.horizontal(|ui| {
-                        if running {
-                            if pill(ui, "stop").clicked() {
-                                stop = true;
-                            }
-                        } else {
-                            if pill(ui, "start").clicked() {
-                                start = true;
-                            }
-                            if pill(ui, "clear history").clicked() {
-                                clear = true;
+                        for (t, label) in [
+                            (FarmTab::Games, "farm games"),
+                            (FarmTab::Hours, "farm hours"),
+                        ] {
+                            if tab_button(ui, label, self.farm_tab == t).clicked() {
+                                self.farm_tab = t;
                             }
                         }
                     });
+                    ui.add_space(4.0);
 
-                    let done = self.badge_shared.done.load(Ordering::Relaxed);
-                    let total = self.badge_shared.total.load(Ordering::Relaxed);
-                    if total > 0 {
-                        ui.label(format!("{done} / {total} games"));
-                        ui.add(egui::ProgressBar::new(done as f32 / total as f32));
-                    }
-                    let cur = self
-                        .badge_shared
-                        .current
-                        .lock()
-                        .map(|c| c.join(", "))
-                        .unwrap_or_default();
-                    if !cur.is_empty() {
-                        ui.label(egui::RichText::new(cur).small().color(DIM));
-                    }
-                    ui.label(
-                        egui::RichText::new(
-                            "Keep Quester open. Discord can take up to a day to update the badge.",
-                        )
-                        .small()
-                        .color(DIM),
-                    );
+                    action = match self.farm_tab {
+                        FarmTab::Games => self.ui_farm_games(ui, running, mine),
+                        FarmTab::Hours => self.ui_farm_hours(ui, running, mine),
+                    };
                 });
-            if start {
-                self.start_badge();
-            }
-            if stop {
-                self.badge_shared.cancel.store(true, Ordering::Relaxed);
-            }
-            if clear {
-                badge::history_clear();
-                self.push_log("Badge history cleared");
+            match action {
+                FarmAction::StartGames => self.start_badge(),
+                FarmAction::StartHours => self.start_hours(),
+                FarmAction::Stop => self.badge_shared.cancel.store(true, Ordering::Relaxed),
+                FarmAction::ClearHistory => {
+                    badge::history_clear();
+                    self.push_log("Badge history cleared");
+                }
+                FarmAction::None => {}
             }
             if ctx.input(|i| i.viewport().close_requested()) {
                 self.show_badge = false;
@@ -983,15 +1234,19 @@ impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
         if !self.style_set {
             apply_theme(ctx);
+            spawn_fonts(&self.notifier);
             self.logo = load_logo(ctx);
             self.style_set = true;
         }
         if !self.apps_requested {
             self.apps_requested = true;
             self.load_games();
+            if !self.settings.hide_updates {
+                self.check_updates();
+            }
         }
 
-        self.drain_messages();
+        self.drain_messages(ctx);
         self.poll_alive();
         self.refilter_if_needed();
 
@@ -1012,7 +1267,7 @@ impl eframe::App for App {
             .frame(egui::Frame::none().inner_margin(Margin::symmetric(20.0, 10.0)))
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    if pill(ui, "get badge").clicked() {
+                    if pill(ui, "farm badges").clicked() {
                         if self.show_badge {
                             ctx.send_viewport_cmd_to(
                                 egui::ViewportId::from_hash_of("badge_window"),
@@ -1022,6 +1277,15 @@ impl eframe::App for App {
                             self.badge_unlocked = false;
                             self.badge_ack = false;
                             self.badge_warn_since = None;
+                            self.farm_tab = FarmTab::Games;
+                        } else {
+                            self.farm_tab = if self.badge_shared.mode.load(Ordering::Relaxed)
+                                == MODE_HOURS
+                            {
+                                FarmTab::Hours
+                            } else {
+                                FarmTab::Games
+                            };
                         }
                         self.show_badge = true;
                     }
@@ -1052,13 +1316,19 @@ impl eframe::App for App {
         egui::CentralPanel::default()
             .frame(egui::Frame::none().inner_margin(Margin::symmetric(16.0, 4.0)))
             .show(ctx, |ui| {
-                card_frame().show(ui, |ui| self.ui_games(ui));
+                card_frame().show(ui, |ui| {
+                    if self.tab == Tab::Settings {
+                        self.ui_settings(ui);
+                    } else {
+                        self.ui_games(ui);
+                    }
+                });
             });
 
         self.window_running(ctx);
         self.window_badge(ctx);
         self.window_logs(ctx);
-        self.window_confirm(ctx);
+        self.window_close(ctx);
     }
 }
 
@@ -1072,6 +1342,7 @@ impl eframe::App for FakeWindowApp {
     fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
         if !self.style_set {
             apply_theme(ctx);
+            setup_fonts(ctx);
             self.logo = load_logo(ctx);
             self.style_set = true;
         }
@@ -1103,6 +1374,8 @@ pub fn run_launcher() {
         APP_NAME,
         eframe::NativeOptions {
             renderer: eframe::Renderer::Glow,
+            multisampling: 0,
+            vsync: cfg!(windows),
             persist_window: false,
             viewport: window_viewport(350.0, 520.0).with_min_inner_size([300.0, 360.0]),
             ..Default::default()
@@ -1114,6 +1387,15 @@ pub fn run_launcher() {
 }
 
 pub fn run_fake_window(title: String) {
+    let viewport = window_viewport(360.0, 200.0)
+        .with_title(&title)
+        .with_resizable(false)
+        .with_maximize_button(false)
+        .with_maximized(false)
+        .with_min_inner_size([360.0, 200.0])
+        .with_max_inner_size([360.0, 200.0]);
+    #[cfg(not(windows))]
+    let viewport = viewport.with_app_id("Quester.Game");
     let options = eframe::NativeOptions {
         renderer: eframe::Renderer::Glow,
         multisampling: 0,
@@ -1121,13 +1403,7 @@ pub fn run_fake_window(title: String) {
         stencil_buffer: 0,
         vsync: true,
         persist_window: false,
-        viewport: window_viewport(360.0, 200.0)
-            .with_title(&title)
-            .with_resizable(false)
-            .with_maximize_button(false)
-            .with_maximized(false)
-            .with_min_inner_size([360.0, 200.0])
-            .with_max_inner_size([360.0, 200.0]),
+        viewport,
         ..Default::default()
     };
     let window_title = title.clone();

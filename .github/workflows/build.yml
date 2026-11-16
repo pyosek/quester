@@ -2,6 +2,12 @@ name: Build
 
 on:
   workflow_dispatch:
+  push:
+    branches: [main, master]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
 
 jobs:
   build:
@@ -11,11 +17,12 @@ jobs:
         include:
           - os: windows-latest
             artifact: quester-windows
-            path: target/release/*.exe
+            path: target/release/quester.exe
           - os: ubuntu-latest
             artifact: quester-linux
             path: target/release/quester
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
 
@@ -33,6 +40,10 @@ jobs:
 
       - name: Build
         run: cargo build --release
+
+      - name: Show sizes
+        shell: bash
+        run: ls -l "${{ matrix.path }}"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4

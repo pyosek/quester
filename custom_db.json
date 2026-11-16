@@ -1,13 +1,7 @@
 [
   {
-    "name": "Firefox",
-    "folder": "Mozilla Firefox",
-    "exe": ["firefox.exe"]
-  },
-  {
-    "name": "EA SPORTS FC™ 27",
-    "type": "steam",
-    "folder": "EA SPORTS FC 27",
-    "exe": ["FC27.exe"]
+    "name": "please update quester",
+    "folder": "update",
+    "exe": ["quester.exe"]
   }
 ]

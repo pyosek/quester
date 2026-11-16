@@ -1,0 +1,5 @@
+/target
+/sleeper/target
+games/
+quester_*.json
+quester_crash.log

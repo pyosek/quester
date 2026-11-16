@@ -1,27 +1,14 @@
 use crate::config::{Msg, Notifier, DISCORD_DB_URL, UA};
-use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use reqwest::header::{HeaderMap, HeaderValue, ACCEPT_ENCODING};
 use std::{thread, time::Duration};
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone)]
 pub struct Game {
-    #[serde(default)]
     pub name: String,
-    #[serde(default)]
-    pub folder: String,
-    #[serde(alias = "exe")]
     pub exes: Vec<String>,
-    #[serde(default, rename = "type")]
-    pub kind: String,
-    #[serde(skip)]
     pub lname: String,
-}
-
-impl Game {
-    pub fn is_steam(&self) -> bool {
-        self.kind.eq_ignore_ascii_case("steam")
-    }
+    pub adult: bool,
 }
 
 #[cfg(windows)]
@@ -80,6 +67,19 @@ fn exes_for_app(app: &Value) -> Vec<String> {
     .collect()
 }
 
+const ADULT_THEMES: &[&str] = &["erotic", "adult", "mature", "nsfw", "18+"];
+fn is_adult(app: &Value) -> bool {
+    app["themes"]
+        .as_array()
+        .map(|t| {
+            t.iter().filter_map(|x| x.as_str()).any(|x| {
+                let x = x.to_lowercase();
+                ADULT_THEMES.iter().any(|a| x.contains(a))
+            })
+        })
+        .unwrap_or(false)
+}
+
 fn build_games(apps: &[Value]) -> Vec<Game> {
     let mut out: Vec<Game> = apps
         .iter()
@@ -91,10 +91,9 @@ fn build_games(apps: &[Value]) -> Vec<Game> {
             }
             Some(Game {
                 lname: name.to_lowercase(),
+                adult: is_adult(a),
                 name,
-                folder: String::new(),
                 exes,
-                kind: String::new(),
             })
         })
         .collect();

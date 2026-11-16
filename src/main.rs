@@ -3,9 +3,9 @@
 mod badge;
 mod config;
 mod discord;
-mod github;
 mod gui;
 mod process;
+mod update;
 
 use std::env;
 
@@ -22,7 +22,18 @@ fn main() {
         } else {
             "Game".to_string()
         };
-        badge::run_lite_window(title, ttl);
+        badge::run_lite_window(title, ttl, false);
+        return;
+    }
+
+    if args.get(1).map(String::as_str) == Some("--sleep-hidden") {
+        let ttl = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(120);
+        let title = if args.len() > 3 {
+            args[3..].join(" ")
+        } else {
+            "Game".to_string()
+        };
+        badge::run_lite_window(title, ttl, true);
         return;
     }
 
@@ -33,6 +44,10 @@ fn main() {
             "Game".to_string()
         };
         gui::run_fake_window(title);
+        return;
+    }
+
+    if process::is_fake_copy() {
         return;
     }
 

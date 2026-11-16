@@ -1,15 +1,19 @@
 # Quester
 
-> Formerly known as **Yarok Launcher**.
+<p>
+  <a href="https://github.com/pyosek/quester/releases"><img src="https://img.shields.io/github/downloads/pyosek/quester/total?style=flat&color=21262d&labelColor=30363d&label=downloads" alt="downloads"></a>
+  <a href="https://discord.gg/5dGwUu8HaX"><img src="https://img.shields.io/badge/Discord-Join%20Server-5865F2?style=flat&logo=discord&logoColor=white" alt="Discord"></a>
+</p>
 
-A small utility that fakes game launches so Discord detects you as "playing" a game. Lets you complete Discord quests without installing the games.
+A utility that fakes game launches so Discord detects you as "playing" a game. Lets you complete Discord quests and farm the Games Played / Hours Played badges without installing the games
 
 ## How it works
 Quester downloads Discord's list of detectable games. When you press **Run**, it copies itself under the game's executable name into a `games` folder next to the app and starts it as a small window. Discord sees that process and shows the game as running. No real game files are downloaded.
+## Features
 
-On Windows, Steam games can optionally be placed in the matching Steam library folder (`steamapps/common/<game>`) after confirmation.
-On Linux, the same works for native, distro, and Flatpak Steam libraries discovered under `~/.steam`, `~/.local/share/Steam`, and `~/.var/app/com.valvesoftware.Steam`. Quester writes a `quester.txt` marker into folders it creates and refuses to overwrite folders or files it did not create.
-
+- **Fake quests** — Quester tricks Discord into thinking you're playing a game, so you can complete "Play a game on Desktop" quests in seconds.
+- **Farm games** — Get the "Games Played" badge by cycling through dozens of different titles.
+- **Farm hours** — Accumulate the total hours played on your Discord profile automatically. Just set the timer and let Quester do the work.
 ## Linux
 Requirements: a Rust toolchain and the usual desktop/OpenGL libraries (X11 or Wayland). Build and run with:
 

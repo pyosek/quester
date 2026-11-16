@@ -4,29 +4,40 @@ on:
   workflow_dispatch:
     inputs:
       tag:
+        description: 'Release tag (must match version in Cargo.toml, e.g. v1.2.1)'
         required: true
         default: 'v1.2.1'
       prerelease:
         type: boolean
         default: false
+  push:
+    tags:
+      - 'v*'
 
 concurrency:
-  group: release-${{ inputs.tag }}
+  group: release-${{ inputs.tag || github.ref_name }}
   cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
+  TAG: ${{ inputs.tag || github.ref_name }}
 
 jobs:
   validate:
     runs-on: ubuntu-latest
     steps:
-      - name: Validate tag
-        env:
-          TAG: ${{ inputs.tag }}
+      - uses: actions/checkout@v4
+
+      - name: Validate tag and version
         run: |
           if ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; then
             echo "Invalid tag '$TAG'" >&2
+            exit 1
+          fi
+          CARGO_VER=$(grep -m1 '^version' Cargo.toml | sed -E 's/version *= *"([^"]+)"/\1/')
+          if [ "v$CARGO_VER" != "$TAG" ]; then
+            echo "Tag $TAG does not match Cargo.toml version $CARGO_VER." >&2
+            echo "The in-app update check compares them, so bump Cargo.toml first." >&2
             exit 1
           fi
 
@@ -71,25 +82,17 @@ jobs:
         if: matrix.platform == 'windows'
         shell: pwsh
         env:
-          TAG: ${{ inputs.tag }}
           NAME: ${{ github.event.repository.name }}
         run: |
-          $exes = Get-ChildItem -Path "target/release/*.exe"
-          if ($exes.Count -eq 0) { throw "No exe files found" }
-
           $pkg = "pkg/$env:NAME"
           New-Item -ItemType Directory -Force -Path $pkg | Out-Null
           New-Item -ItemType Directory -Force -Path dist | Out-Null
-
-          Copy-Item $exes.FullName -Destination $pkg
-
-          $zip = "dist/$env:NAME-$env:TAG-windows.zip"
-          Compress-Archive -Path $pkg -DestinationPath $zip -Force
+          Copy-Item "target/release/quester.exe" -Destination $pkg
+          Compress-Archive -Path $pkg -DestinationPath "dist/$env:NAME-$env:TAG-windows.zip" -Force
 
       - name: Package (Linux)
         if: matrix.platform == 'linux'
         env:
-          TAG: ${{ inputs.tag }}
           NAME: ${{ github.event.repository.name }}
         run: |
           mkdir -p "pkg/$NAME" dist
@@ -118,11 +121,11 @@ jobs:
       - name: Create Release and Upload Assets
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ inputs.tag }}
-          name: Release ${{ inputs.tag }}
+          tag_name: ${{ env.TAG }}
+          name: Release ${{ env.TAG }}
           target_commitish: ${{ github.sha }}
           files: dist/*
           fail_on_unmatched_files: true
           draft: false
-          prerelease: ${{ inputs.prerelease }}
+          prerelease: ${{ inputs.prerelease || false }}
           generate_release_notes: true

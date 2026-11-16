@@ -1,5 +1,5 @@
 use crate::{
-    config::{exe_dir, games_dir, now_ts, MARKER_FILE, MARKER_TEXT},
+    config::{exe_dir, games_dir, now_ts},
     discord::Game,
 };
 use serde::{Deserialize, Serialize};
@@ -7,7 +7,12 @@ use std::{
     env, fs,
     path::{Path, PathBuf},
     process::Command,
-    sync::OnceLock,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Mutex, OnceLock,
+    },
+    thread,
+    time::Duration,
 };
 
 #[cfg(windows)]
@@ -75,183 +80,6 @@ fn norm_path(s: &str) -> String {
     s.trim_end_matches('/').to_string()
 }
 
-#[derive(Clone, Copy, PartialEq)]
-pub enum SteamState {
-    Invalid,
-    NoDir,
-    Ours,
-    Foreign,
-}
-
-#[cfg(windows)]
-fn reg_steam_path() -> Option<PathBuf> {
-    let o = Command::new("reg")
-        .args(["query", r"HKCU\Software\Valve\Steam", "/v", "SteamPath"])
-        .quiet()
-        .output()
-        .ok()?;
-    let s = String::from_utf8_lossy(&o.stdout);
-    for l in s.lines() {
-        if let Some(i) = l.find("REG_SZ") {
-            let v = l[i + 6..].trim();
-            if !v.is_empty() {
-                return Some(PathBuf::from(v.replace('/', "\\")));
-            }
-        }
-    }
-    None
-}
-
-fn push_unique(v: &mut Vec<PathBuf>, p: PathBuf) {
-    if !v.contains(&p) {
-        v.push(p);
-    }
-}
-
-#[cfg(windows)]
-fn steam_install_roots() -> Vec<PathBuf> {
-    let mut bases: Vec<PathBuf> = vec![];
-    if let Some(p) = reg_steam_path() {
-        bases.push(p);
-    }
-    bases.push(PathBuf::from(r"C:\Program Files (x86)\Steam"));
-    bases
-}
-
-#[cfg(not(windows))]
-fn steam_install_roots() -> Vec<PathBuf> {
-    let mut bases: Vec<PathBuf> = vec![];
-    if let Some(home) = env::var_os("HOME").map(PathBuf::from) {
-        push_unique(&mut bases, home.join(".steam").join("steam"));
-        push_unique(&mut bases, home.join(".local").join("share").join("Steam"));
-        push_unique(&mut bases, home.join(".steam").join("root"));
-        push_unique(
-            &mut bases,
-            home.join(".var")
-                .join("app")
-                .join("com.valvesoftware.Steam")
-                .join(".local")
-                .join("share")
-                .join("Steam"),
-        );
-    }
-    bases
-}
-
-#[cfg(windows)]
-fn parse_library_path(raw: &str) -> PathBuf {
-    PathBuf::from(raw.replace("\\\\", "\\"))
-}
-
-#[cfg(not(windows))]
-fn parse_library_path(raw: &str) -> PathBuf {
-    PathBuf::from(raw)
-}
-
-fn steam_roots() -> &'static Vec<PathBuf> {
-    static ROOTS: OnceLock<Vec<PathBuf>> = OnceLock::new();
-    ROOTS.get_or_init(|| {
-        let bases = steam_install_roots();
-
-        let mut libs: Vec<PathBuf> = vec![];
-        for b in &bases {
-            if !b.join("steamapps").is_dir() {
-                continue;
-            }
-            push_unique(&mut libs, b.clone());
-            if let Ok(t) = fs::read_to_string(b.join("steamapps").join("libraryfolders.vdf")) {
-                for l in t.lines() {
-                    let parts: Vec<&str> = l.split('"').collect();
-                    if parts.len() >= 4 && parts[1] == "path" {
-                        push_unique(&mut libs, parse_library_path(parts[3]));
-                    }
-                }
-            }
-        }
-        libs.into_iter()
-            .map(|l| l.join("steamapps").join("common"))
-            .filter(|c| c.is_dir())
-            .collect()
-    })
-}
-
-fn resolve_common_dir(root: &Path, folder: &str) -> PathBuf {
-    let direct = root.join(folder);
-    if direct.exists() {
-        return direct;
-    }
-    #[cfg(not(windows))]
-    {
-        if let Ok(rd) = fs::read_dir(root) {
-            for e in rd.flatten() {
-                if e.file_name()
-                    .to_string_lossy()
-                    .eq_ignore_ascii_case(folder)
-                {
-                    return e.path();
-                }
-            }
-        }
-    }
-    direct
-}
-
-fn inside_root(p: &Path, root: &Path) -> bool {
-    match (fs::canonicalize(p), fs::canonicalize(root)) {
-        (Ok(a), Ok(b)) => a.starts_with(&b),
-        _ => false,
-    }
-}
-
-fn steam_loc(g: &Game) -> Option<(PathBuf, PathBuf)> {
-    let folder = crate::discord::normalize_rel(&g.folder);
-    if folder.is_empty() || !rel_is_safe(&folder) {
-        return None;
-    }
-    let roots = steam_roots();
-    for r in roots {
-        let d = resolve_common_dir(r, &folder);
-        if d.exists() {
-            return Some((r.clone(), d));
-        }
-    }
-    roots.first().map(|r| (r.clone(), r.join(&folder)))
-}
-
-pub fn steam_dir(g: &Game) -> Option<PathBuf> {
-    steam_loc(g).map(|x| x.1)
-}
-
-fn marker_ok(dir: &Path) -> bool {
-    fs::read_to_string(dir.join(MARKER_FILE))
-        .map(|s| s.trim_start_matches('\u{feff}').trim() == MARKER_TEXT)
-        .unwrap_or(false)
-}
-
-pub fn steam_state(g: &Game) -> SteamState {
-    let Some((root, dir)) = steam_loc(g) else {
-        return SteamState::Invalid;
-    };
-    if !dir.exists() {
-        SteamState::NoDir
-    } else if inside_root(&dir, &root) && marker_ok(&dir) {
-        SteamState::Ours
-    } else {
-        SteamState::Foreign
-    }
-}
-
-pub fn steam_needs_confirm(g: &Game) -> bool {
-    let Some(dir) = steam_dir(g) else {
-        return true;
-    };
-    steam_state(g) != SteamState::Ours
-        || !g
-            .exes
-            .iter()
-            .any(|r| rel_is_safe(r) && dir.join(r).exists())
-}
-
 fn manifest_load() -> Vec<ManifestEntry> {
     fs::read_to_string(manifest_path())
         .ok()
@@ -306,6 +134,8 @@ pub struct RunningEntry {
     pub pid: u32,
     pub app_name: String,
     pub start_ts: u64,
+    #[serde(default)]
+    pub hours: bool,
 }
 
 fn running_path() -> PathBuf {
@@ -323,6 +153,41 @@ pub fn running_save(entries: &[RunningEntry]) {
     if let Ok(s) = serde_json::to_string_pretty(entries) {
         let _ = fs::write(running_path(), s);
     }
+}
+
+static RUNNING_LOCK: Mutex<()> = Mutex::new(());
+
+pub fn running_replace_normal(entries: &[RunningEntry]) {
+    let _g = RUNNING_LOCK.lock();
+    let mut v: Vec<RunningEntry> = running_load().into_iter().filter(|e| e.hours).collect();
+    v.extend(entries.iter().cloned());
+    running_save(&v);
+}
+
+pub fn running_add_hours(entries: Vec<RunningEntry>) {
+    let _g = RUNNING_LOCK.lock();
+    let mut v = running_load();
+    v.extend(entries);
+    running_save(&v);
+}
+
+pub fn running_remove_pids(pids: &[u32]) {
+    let _g = RUNNING_LOCK.lock();
+    let mut v = running_load();
+    v.retain(|e| !pids.contains(&e.pid));
+    running_save(&v);
+}
+
+pub fn kill_hours_orphans(before_ts: u64) -> usize {
+    let _g = RUNNING_LOCK.lock();
+    let all = running_load();
+    let (old, keep): (Vec<RunningEntry>, Vec<RunningEntry>) = all
+        .into_iter()
+        .partition(|e| e.hours && e.start_ts < before_ts);
+    let pids: Vec<u32> = old.iter().map(|e| e.pid).collect();
+    let killed = kill_ours(&pids);
+    running_save(&keep);
+    killed
 }
 
 #[cfg(windows)]
@@ -343,17 +208,32 @@ pub fn alive_pids() -> Option<Vec<u32>> {
     )
 }
 
+#[cfg(windows)]
+pub fn alive_of(pids: &[u32]) -> Option<Vec<u32>> {
+    let all = alive_pids()?;
+    Some(pids.iter().copied().filter(|p| all.contains(p)).collect())
+}
+
 #[cfg(not(windows))]
-pub fn alive_pids() -> Option<Vec<u32>> {
-    let mut pids = Vec::new();
-    for entry in fs::read_dir("/proc").ok()?.flatten() {
-        if let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() {
-            if entry.path().join("stat").is_file() {
-                pids.push(pid);
-            }
-        }
-    }
-    Some(pids)
+pub fn alive_of(pids: &[u32]) -> Option<Vec<u32>> {
+    Some(
+        pids.iter()
+            .copied()
+            .filter(|pid| {
+                fs::read_to_string(format!("/proc/{pid}/stat"))
+                    .map(|s| !is_zombie(&s))
+                    .unwrap_or(false)
+            })
+            .collect(),
+    )
+}
+
+#[cfg(not(windows))]
+fn is_zombie(stat: &str) -> bool {
+    stat.rfind(')')
+        .and_then(|i| stat[i + 1..].split_whitespace().next())
+        .map(|s| s == "Z" || s == "X")
+        .unwrap_or(false)
 }
 
 #[cfg(windows)]
@@ -399,20 +279,6 @@ fn pid_path_is_ours(p: &Path) -> bool {
             return true;
         }
     }
-    for root in steam_roots() {
-        let Ok(r) = fs::canonicalize(root) else { continue };
-        if !p.starts_with(&r) {
-            continue;
-        }
-        for anc in p.ancestors().skip(1) {
-            if anc == r || !anc.starts_with(&r) {
-                break;
-            }
-            if marker_ok(anc) {
-                return true;
-            }
-        }
-    }
     false
 }
 
@@ -431,8 +297,280 @@ pub fn kill_pid(pid: u32) {
     }
 }
 
-pub fn launch_fake(g: &Game) -> (Option<u32>, Vec<String>) {
-    let mut log = vec![];
+#[cfg(windows)]
+fn ours_among(pids: &[u32]) -> Vec<u32> {
+    let mut res = vec![];
+    for chunk in pids.chunks(100) {
+        let list = chunk
+            .iter()
+            .map(|p| p.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let script = format!(
+            "Get-Process -Id {list} -ErrorAction SilentlyContinue | ForEach-Object {{ \"$($_.Id)|$($_.Path)\" }}"
+        );
+        let Ok(o) = Command::new("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+            .quiet()
+            .output()
+        else {
+            continue;
+        };
+        for line in String::from_utf8_lossy(&o.stdout).lines() {
+            let Some((id, path)) = line.trim().split_once('|') else {
+                continue;
+            };
+            let (Ok(id), false) = (id.parse::<u32>(), path.is_empty()) else {
+                continue;
+            };
+            if let Ok(p) = fs::canonicalize(path) {
+                if pid_path_is_ours(&p) {
+                    res.push(id);
+                }
+            }
+        }
+    }
+    res
+}
+
+#[cfg(not(windows))]
+fn ours_among(pids: &[u32]) -> Vec<u32> {
+    pids.iter().copied().filter(|p| pid_is_ours(*p)).collect()
+}
+
+#[cfg(windows)]
+fn kill_many(pids: &[u32]) {
+    for chunk in pids.chunks(100) {
+        let mut c = Command::new("taskkill");
+        for p in chunk {
+            c.arg("/PID").arg(p.to_string());
+        }
+        let _ = c.arg("/F").quiet().output();
+    }
+}
+
+#[cfg(not(windows))]
+fn kill_many(pids: &[u32]) {
+    for p in pids {
+        kill_pid(*p);
+    }
+}
+
+static SCAN_DONE: AtomicBool = AtomicBool::new(true);
+
+pub fn wait_orphan_scan() {
+    for _ in 0..100 {
+        if SCAN_DONE.load(Ordering::Relaxed) {
+            return;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+pub fn spawn_orphan_cleanup(launch_ts: u64) {
+    SCAN_DONE.store(false, Ordering::Relaxed);
+    thread::spawn(move || {
+        kill_hours_orphans(launch_ts);
+        kill_unlisted_orphans();
+        SCAN_DONE.store(true, Ordering::Relaxed);
+    });
+}
+
+fn kill_unlisted_orphans() {
+    let _g = RUNNING_LOCK.lock();
+    let listed: Vec<u32> = running_load().iter().map(|e| e.pid).collect();
+    let orphans: Vec<u32> = pids_in_games()
+        .into_iter()
+        .filter(|p| !listed.contains(p))
+        .collect();
+    kill_many(&orphans);
+}
+
+#[cfg(windows)]
+fn pids_in_games() -> Vec<u32> {
+    let base = games_dir().to_string_lossy().replace('\'', "''");
+    let script = format!(
+        "$p = '{base}\\'; Get-Process | Where-Object {{ $_.Path -and $_.Path.StartsWith($p, [System.StringComparison]::OrdinalIgnoreCase) }} | ForEach-Object {{ $_.Id }}"
+    );
+    let Ok(o) = Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .quiet()
+        .output()
+    else {
+        return vec![];
+    };
+    String::from_utf8_lossy(&o.stdout)
+        .lines()
+        .filter_map(|l| l.trim().parse().ok())
+        .collect()
+}
+
+#[cfg(not(windows))]
+fn pids_in_games() -> Vec<u32> {
+    let Ok(g) = fs::canonicalize(games_dir()) else {
+        return vec![];
+    };
+    let Ok(rd) = fs::read_dir("/proc") else {
+        return vec![];
+    };
+    rd.flatten()
+        .filter_map(|e| {
+            let pid = e.file_name().to_string_lossy().parse::<u32>().ok()?;
+            let link = fs::read_link(e.path().join("exe")).ok()?;
+            let link = link.to_string_lossy().to_string();
+            let link = link.strip_suffix(" (deleted)").unwrap_or(&link).to_string();
+            Path::new(&link).starts_with(&g).then_some(pid)
+        })
+        .collect()
+}
+
+pub fn kill_ours(pids: &[u32]) -> usize {
+    let ours = ours_among(pids);
+    kill_many(&ours);
+    ours.len()
+}
+
+const MANUAL_TTL: u64 = 31_536_000;
+
+static SLEEPER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/sleeper.bin"));
+
+pub fn sleeper_template() -> Result<PathBuf, String> {
+    env::current_exe().map_err(|e| format!("current_exe: {e}"))
+}
+
+pub fn write_sleeper(target: &Path) -> std::io::Result<()> {
+    fs::write(target, SLEEPER)
+}
+
+pub fn sleeper_present(target: &Path) -> bool {
+    fs::metadata(target)
+        .map(|m| m.len() == SLEEPER.len() as u64)
+        .unwrap_or(false)
+}
+
+fn sleeper_hash() -> u32 {
+    let mut h: u32 = 0x811C_9DC5;
+    for b in SLEEPER {
+        h ^= *b as u32;
+        h = h.wrapping_mul(0x0100_0193);
+    }
+    h
+}
+
+fn sleeper_tpl() -> Option<&'static Path> {
+    static TPL: OnceLock<Option<PathBuf>> = OnceLock::new();
+    TPL.get_or_init(|| {
+        let dir = games_dir().join("_tpl");
+        fs::create_dir_all(&dir).ok()?;
+        let ext = if cfg!(windows) { ".exe" } else { "" };
+        let p = dir.join(format!("sleeper-{:08x}{ext}", sleeper_hash()));
+        if !sleeper_present(&p) {
+            let _ = fs::remove_file(&p);
+            fs::write(&p, SLEEPER).ok()?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = fs::set_permissions(&p, fs::Permissions::from_mode(0o755));
+            }
+        }
+        Some(p)
+    })
+    .as_deref()
+}
+
+pub fn ensure_sleeper(target: &Path) -> std::io::Result<()> {
+    if sleeper_present(target) {
+        return Ok(());
+    }
+    let _ = fs::remove_file(target);
+    if let Some(tpl) = sleeper_tpl() {
+        if fs::hard_link(tpl, target).is_ok() || fs::copy(tpl, target).is_ok() {
+            return Ok(());
+        }
+    }
+    fs::write(target, SLEEPER)
+}
+
+pub fn sleeper_args(ttl: u64, hidden: bool, title: &str) -> Vec<String> {
+    vec![
+        ttl.to_string(),
+        (hidden as u8).to_string(),
+        (is_tiling_wm() as u8).to_string(),
+        title.to_string(),
+    ]
+}
+
+#[cfg(target_os = "linux")]
+pub fn is_tiling_wm() -> bool {
+    const ENV: &[&str] = &["NIRI_SOCKET", "HYPRLAND_INSTANCE_SIGNATURE", "SWAYSOCK", "I3SOCK"];
+    if ENV.iter().any(|k| env::var_os(k).is_some()) {
+        return true;
+    }
+    const NAMES: &[&str] = &[
+        "niri", "hyprland", "sway", "i3", "bspwm", "river", "dwl", "awesome", "qtile", "xmonad",
+        "dwm", "herbstluftwm", "leftwm", "scrollwm", "mango", "labwc-tiling",
+    ];
+    ["XDG_CURRENT_DESKTOP", "XDG_SESSION_DESKTOP", "DESKTOP_SESSION"]
+        .iter()
+        .filter_map(|k| env::var(k).ok())
+        .flat_map(|v| {
+            v.split(|c| c == ':' || c == ';')
+                .map(|s| s.trim().to_lowercase())
+                .collect::<Vec<_>>()
+        })
+        .any(|d| NAMES.contains(&d.as_str()))
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn is_tiling_wm() -> bool {
+    false
+}
+
+pub fn ensure_games_marker(create: bool) {
+    let dir = games_dir();
+    if !dir.exists() {
+        if !create || fs::create_dir_all(&dir).is_err() {
+            return;
+        }
+    }
+    if create && !running_path().exists() {
+        let _ = fs::write(running_path(), "[]");
+    }
+}
+
+pub fn is_fake_copy() -> bool {
+    let Ok(me) = env::current_exe() else {
+        return false;
+    };
+    for dir in me.ancestors().skip(1).take(12) {
+        let is_games = dir
+            .file_name()
+            .map(|n| n.to_string_lossy().eq_ignore_ascii_case("games"))
+            .unwrap_or(false);
+        if is_games {
+            if let Some(p) = dir.parent() {
+                if [
+                    "quester_manifest.json",
+                    "quester_running.json",
+                    "settings.json",
+                    "quester_badge_history.json",
+                ]
+                .iter()
+                .any(|f| p.join(f).exists())
+                {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+pub fn launch_fake(g: &Game, lite: bool) -> (Option<u32>, Vec<String>) {
+    wait_orphan_scan();
+    let lite = lite || is_tiling_wm();
+    let mut log: Vec<String> = vec![];
+    ensure_games_marker(true);
 
     let me = match env::current_exe() {
         Ok(p) => p,
@@ -442,50 +580,7 @@ pub fn launch_fake(g: &Game) -> (Option<u32>, Vec<String>) {
         }
     };
 
-    let folder = crate::discord::normalize_rel(&g.folder);
-    if !folder.is_empty() && !rel_is_safe(&folder) {
-        log.push(format!("Refused unsafe folder: {}", g.folder));
-        return (None, log);
-    }
-    let mut base = if folder.is_empty() {
-        games_dir()
-    } else {
-        games_dir().join(&folder)
-    };
-
-    let steam = g.is_steam();
-    let mut steam_root: Option<PathBuf> = None;
-    if steam {
-        let Some((root, dir)) = steam_loc(g) else {
-            log.push("Refused: Steam folder not found or unsafe game folder name".to_string());
-            return (None, log);
-        };
-        match steam_state(g) {
-            SteamState::Foreign => {
-                log.push(format!(
-                    "Refused: {} exists and has no valid {MARKER_FILE}",
-                    dir.display()
-                ));
-                return (None, log);
-            }
-            SteamState::NoDir => {
-                if fs::create_dir_all(&dir).is_err() || !inside_root(&dir, &root) {
-                    log.push(format!("Failed to create folder {}", dir.display()));
-                    return (None, log);
-                }
-                if fs::write(dir.join(MARKER_FILE), MARKER_TEXT).is_err() {
-                    let _ = fs::remove_dir(&dir);
-                    log.push(format!("Failed to write {MARKER_FILE}"));
-                    return (None, log);
-                }
-                log.push(format!("Created folder: {}", dir.display()));
-            }
-            SteamState::Ours => {}
-            SteamState::Invalid => return (None, log),
-        }
-        base = dir.clone();
-        steam_root = Some(root);
-    }
+    let base = games_dir();
 
     for rel in &g.exes {
         let rel = crate::discord::normalize_rel(rel);
@@ -517,23 +612,23 @@ pub fn launch_fake(g: &Game) -> (Option<u32>, Vec<String>) {
         }
 
         if let Some(p) = target.parent() {
-            if steam {
-                let _ = fs::create_dir_all(p);
-            } else {
-                create_dirs_tracked(p, &g.name);
-            }
-            let outside = match &steam_root {
-                Some(r) => !inside_root(p, r),
-                None => !inside_games(p),
-            };
-            if outside {
+            create_dirs_tracked(p, &g.name);
+            if !inside_games(p) {
                 log.push(format!("Refused: {rel} resolves outside allowed folder"));
                 continue;
             }
         }
-        if fs::copy(&me, &target).is_err() && !target.exists() {
-            log.push(format!("Failed to copy {rel}"));
-            continue;
+
+        if !target.exists() {
+            let ok = if lite {
+                ensure_sleeper(&target).is_ok()
+            } else {
+                fs::hard_link(&me, &target).is_ok() || fs::copy(&me, &target).is_ok()
+            };
+            if !ok {
+                log.push(format!("Failed to copy {rel}"));
+                continue;
+            }
         }
         #[cfg(unix)]
         {
@@ -550,9 +645,18 @@ pub fn launch_fake(g: &Game) -> (Option<u32>, Vec<String>) {
                 size,
             });
         }
-        return match Command::new(&target).arg("--sleep").arg(&g.name).quiet().spawn() {
-            Ok(c) => {
+        let mut cmd = Command::new(&target);
+        if lite {
+            cmd.args(sleeper_args(MANUAL_TTL, false, &g.name));
+        } else {
+            cmd.arg("--sleep").arg(&g.name);
+        }
+        return match cmd.quiet().spawn() {
+            Ok(mut c) => {
                 let pid = c.id();
+                thread::spawn(move || {
+                    let _ = c.wait();
+                });
                 log.push(format!("Launched: {rel} (PID {pid})"));
                 (Some(pid), log)
             }
